@@ -1,0 +1,14 @@
+# Icarus
+
+This is me flying to close to the sun.
+Goal: > 95% MNIST test accuracy raw c
+
+To implement:
+- [ ] memory management
+- [ ] basic ops
+- [ ] reshape ops
+- [ ] reduce ops
+- [ ] nn ops 
+- [ ] back prop
+- [ ] layers (Conv2d, BatchNorm, Linear)
+- [ ] ADAM
