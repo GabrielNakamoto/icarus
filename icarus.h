@@ -19,12 +19,25 @@ f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
 // Reshape Ops
 tensor *tensor_reshape(tensor *t, i32 *newshape, i32 newndims);
 
-// Elementwise Ops
+// Unary Ops
+tensor *tensor_pow(tensor *t, f32 n);
+tensor *tensor_exp(tensor *t);
+tensor *tensor_log(tensor *t);
+
+// Binary Ops
 tensor *tensor_mul(tensor *a, tensor *b);
+tensor *tensor_div(tensor *a, tensor *b);
 tensor *tensor_add(tensor *a, tensor *b);
+tensor *tensor_sub(tensor *a, tensor *b);
+
+tensor *tensor_mul_scalar(tensor *a, f32 b);
+tensor *tensor_div_scalar(tensor *a, f32 b);
+tensor *tensor_add_scalar(tensor *a, f32 b);
+tensor *tensor_sub_scalar(tensor *a, f32 b);
 
 // Reduce Ops
 tensor *tensor_sum(tensor *t, i32 axis);
+tensor *tensor_mean(tensor *t, i32 axis);
 
 // Composed Ops
 tensor *tensor_gemm(tensor *a, tensor *b);
@@ -38,17 +51,19 @@ void print_shape(tensor *t) {
 	printf(")\n");
 }
 
+
+// Helper funcs
 i32 get_size(i32 *shape, i32 ndims) {
 	i32 size = 1;
 	for (i32 i=0; i<ndims; ++i) size *= shape[i];
 	return size;
 }
 
-// Stride helpers
 void calculate_strides(i32 *shape, i32 ndims, i32 **strides) {
 	(*strides)[ndims-1]=1;
 	for (i32 i=ndims-2; i>=0; i--) (*strides)[i]=shape[i+1]*(*strides)[i+1];
 }
+
 i32 *broadcast_strides(tensor *t) {
 	i32 *bstrides = (i32*) malloc(t->ndims * sizeof(i32));
 	for (i32 i=0; i<t->ndims; ++i) bstrides[i] = t->shape[i] == 1 ? 0 : t->strides[i];
@@ -59,6 +74,16 @@ i32 *broadcast_shape(i32 *a_sh, i32 *b_sh, i32 ndims) {
 	i32 *bshape = (i32*) malloc(ndims * sizeof(i32));
 	for (int i=0; i<ndims; ++i) bshape[i] = a_sh[i] == 1 ? b_sh[i] : a_sh[i];
 	return bshape;
+}
+
+int tensor_getidx(int *strides, int ndims, int *indices) {
+	int idx = 0;
+	for (int i=0; i<ndims; ++i) idx += strides[i] * indices[i];
+	return idx;
+}
+
+f32 *tensor_getitem(tensor *t, int *strides, int *indices) {
+	return t->data + tensor_getidx(strides, t->ndims, indices);
 }
 
 int inc_shapeindex(int *indices, int *shape, int ndims) {
@@ -73,16 +98,6 @@ int inc_shapeindex(int *indices, int *shape, int ndims) {
 		}
 	}
 	return 1;
-}
-
-int tensor_getidx(int *strides, int ndims, int *indices) {
-	int idx = 0;
-	for (int i=0; i<ndims; ++i) idx += strides[i] * indices[i];
-	return idx;
-}
-
-f32 *tensor_getitem(tensor *t, int *strides, int *indices) {
-	return t->data + tensor_getidx(strides, t->ndims, indices);
 }
 
 /*
@@ -179,13 +194,20 @@ tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*op)(f32, f32)) {
 	return c;
 }
 
-f32 _mul(f32 a, f32 b) { return a * b; }
-tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &_mul); }
-tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &_mul); }
+f32 __mul(f32 a, f32 b) { return a * b; }
+f32 __add(f32 a, f32 b) { return a + b; }
 
-f32 _add(f32 a, f32 b) { return a + b; }
-tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &_add); }
-tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &_add); }
+tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__mul); }
+tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__mul); }
+
+tensor *tensor_div(tensor *a, tensor *b) { return tensor_mul(a, tensor_pow(b, -1)); }
+tensor *tensor_div_scalar(tensor *a, f32 b) { return tensor_mul_scalar(a, 1.0 / b); }
+
+tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__add); }
+tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add); }
+
+tensor *tensor_sub(tensor *a, tensor *b) { return tensor_add(a, tensor_mul_scalar(b, -1)); }
+tensor *tensor_sub_scalar(tensor *a, f32 b) { return tensor_add_scalar(a, b * -1); }
 
 /*
 * Reduce Ops
@@ -215,11 +237,13 @@ tensor *tensor_apply_reduceop(tensor *t, int axis, void (*op)(f32*, f32)) {
 	return r;
 }
 
-void _redu_add(f32 *a, f32 b) { *a += b; }
-tensor *tensor_sum(tensor *t, int axis) {
-	return tensor_apply_reduceop(t, axis, &_redu_add);
-}
+void __sum(f32 *a, f32 b) { *a += b; }
+tensor *tensor_sum(tensor *t, int axis) { return tensor_apply_reduceop(t, axis, &__sum); }
+tensor *tensor_mean(tensor *t, int axis) { return tensor_div_scalar(tensor_sum(t, axis), t->shape[axis]); }
 
+/*
+* Composed ops
+*/
 tensor *tensor_gemm(tensor *a, tensor *b) {
 	if (a->shape[1] != b->shape[0]) return NULL;
 
@@ -233,6 +257,7 @@ tensor *tensor_gemm(tensor *a, tensor *b) {
 
 	return tensor_sum(c, 1);
 }
+
 
 tensor *alloc_tensor(i32 *shape, i32 ndims) {
 	int size = get_size(shape, ndims);
