@@ -19,16 +19,8 @@ f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
 tensor *tensor_reshape(tensor *t, i32 *newshape, i32 newndims);
 
 // Elementwise Ops
-typedef struct {
-	tensor *a;
-	tensor *b;
-	tensor *c;
-	i32 *a_bstrides;
-	i32 *b_bstrides;
-	i32 *iter;
-} bi_op;
-
 tensor *tensor_mul(tensor *a, tensor *b);
+tensor *tensor_add(tensor *a, tensor *b);
 
 // Reduce Ops
 tensor *tensor_reduce(tensor *t, i32 axis);
@@ -108,65 +100,72 @@ tensor *tensor_reshape(tensor *t, int *newshape, int ndims) {
 	return t;
 }
 
-bi_op *tensor_binaryop(tensor *a, tensor *b) {
-	bi_op *op = (bi_op*) malloc(sizeof(bi_op));
-
+/*
+* Binary Elementwise Ops
+*/
+tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*op)(f32, f32)) {
 	i32 *cshape = broadcast_shape(a->shape, b->shape, a->ndims);
-	op->c = alloc_tensor(cshape, a->ndims);
-	op->a=a; op->b=b;
-	op->a_bstrides = broadcast_strides(a);
-	op->b_bstrides = broadcast_strides(b);
-	op->iter = (i32*) malloc(a->ndims * sizeof(i32));
-	memset(op->iter, 0, a->ndims * sizeof(int));
+	tensor *c = alloc_tensor(cshape, a->ndims);
+
+	i32 *a_bstrides = broadcast_strides(a); i32 *b_bstrides = broadcast_strides(b);
+	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
+	memset(iter, 0, a->ndims * sizeof(i32));
+
+	do {
+		f32 *av = tensor_getitem(a, a_bstrides, iter);
+		f32 *bv = tensor_getitem(b, b_bstrides, iter);
+		f32 *cv = tensor_getitem(c, c->strides, iter);
+		*cv = op(*av, *bv);
+	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
 
 	free(cshape);
-	return op;
+	return c;
 }
 
+f32 _mul(f32 a, f32 b) { return a * b; }
 tensor *tensor_mul(tensor *a, tensor *b) {
 	if (a->ndims != b->ndims) return NULL;
-
-	bi_op *op = tensor_binaryop(a, b);
-	do {
-		f32 *av = tensor_getitem(a, op->a_bstrides, op->iter);
-		f32 *bv = tensor_getitem(b, op->b_bstrides, op->iter);
-		f32 *cv = tensor_getitem(op->c, op->c->strides, op->iter);
-		*cv = (*av) * (*bv);
-	} while (inc_shapeindex(op->iter, op->c->shape, op->c->ndims) != -1);
-
-	return op->c;
+	return tensor_apply_biop(a, b, &_mul);
 }
 
-tensor *tensor_reduce(tensor *t, int axis) {
+f32 _add(f32 a, f32 b) { return a + b; }
+tensor *tensor_add(tensor *a, tensor *b) {
+	if (a->ndims != b->ndims) return NULL;
+	return tensor_apply_biop(a, b, &_mul);
+}
+
+
+/*
+* Reduce Ops
+*/
+tensor *tensor_apply_reduceop(tensor *t, int axis, void (*op)(f32*, f32)) {
 	int *nshape = (int*) malloc((t->ndims-1) * sizeof(int));
 	for (int i=0; i<axis; ++i) nshape[i]=t->shape[i];
 	for (int j=axis; j<t->ndims-1; ++j) nshape[j]=t->shape[j+1];
 
 	tensor *r = alloc_tensor(nshape, t->ndims-1);
+
+	int *riter = (int*)malloc(r->ndims * sizeof(int));
+	int *iter = (int*)malloc(t->ndims * sizeof(int));
+	memset(riter, 0, r->ndims * sizeof(int));
+
+	do {
+		for (int i=0; i<t->ndims; ++i) iter[i + (i >= axis)]=riter[i];
+		f32 *a = tensor_getitem(r, r->strides, riter);
+		for (int i=0; i<t->shape[axis]; ++i) {
+			iter[axis]=i;
+			op(a, *tensor_getitem(t, t->strides, iter));
+		}
+	} while (inc_shapeindex(riter, r->shape, r->ndims) != -1);
+	free(riter);
+	free(iter);
+
 	return r;
 }
 
+void _redu_add(f32 *a, f32 b) { *a += b; }
 tensor *tensor_sum(tensor *t, int axis) {
-	tensor *r = tensor_reduce(t, axis);
-	int *rindices = (int*)malloc(r->ndims * sizeof(int));
-	memset(rindices, 0, r->ndims * sizeof(int));
-
-	int *indices = (int*)malloc(t->ndims * sizeof(int));
-	do {
-		for (int i=0; i<t->ndims; ++i) {
-			int j = i + (i >= axis);
-			indices[j]=rindices[i];
-		}
-		f32 *a = tensor_getitem(r, r->strides, rindices);
-		for (int i=0; i<t->shape[axis]; ++i) {
-			indices[axis]=i;
-			*a += *tensor_getitem(t, t->strides, indices);
-		}
-	} while (inc_shapeindex(rindices, r->shape, r->ndims) != -1);
-	free(rindices);
-	free(indices);
-
-	return r;
+	return tensor_apply_reduceop(t, axis, &_redu_add);
 }
 
 tensor *tensor_gemm(tensor *a, tensor *b) {
