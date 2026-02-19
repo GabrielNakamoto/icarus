@@ -38,6 +38,7 @@ tensor *tensor_sub_scalar(tensor *a, f32 b);
 // Reduce Ops
 tensor *tensor_sum(tensor *t, i32 axis);
 tensor *tensor_mean(tensor *t, i32 axis);
+tensor *tensor_max(tensor *t, i32 axis);
 
 // Composed Ops
 tensor *tensor_gemm(tensor *a, tensor *b);
@@ -120,7 +121,7 @@ tensor *tensor_reshape(tensor *t, int *newshape, int ndims) {
 /*
 * Unary Elementwise Ops
 */
-tensor *tensor_apply_unop(tensor *t, f32 (*op)(f32)) {
+tensor *tensor_apply_unop(tensor *t, f32 (*op)(f32, i32), i32 arg) {
 	tensor *nt = alloc_tensor(t->shape, t->ndims);
 	i32 *iter = (i32*) malloc(t->ndims * sizeof(i32));
 	memset(iter, 0, t->ndims * sizeof(i32));
@@ -128,31 +129,18 @@ tensor *tensor_apply_unop(tensor *t, f32 (*op)(f32)) {
 	do {
 		f32 *a = tensor_getitem(t, t->strides, iter);
 		f32 *b = tensor_getitem(nt, nt->strides, iter);
-		*b = op(*a);
+		*b = op(*a, arg);
 	} while(inc_shapeindex(iter, t->shape, t->ndims) != -1);
 	free(iter);
 	return nt;
 }
 
-// TODO: redundant? restructure like exp / log
-tensor *tensor_pow(tensor *t, f32 n) {
-	tensor *nt = alloc_tensor(t->shape, t->ndims);
-	i32 *iter = (i32*) malloc(t->ndims * sizeof(i32));
-	memset(iter, 0, t->ndims * sizeof(i32));
-
-	do {
-		f32 *a = tensor_getitem(t, t->strides, iter);
-		f32 *b = tensor_getitem(nt, nt->strides, iter);
-		*b = powf(*a, n);
-	} while(inc_shapeindex(iter, t->shape, t->ndims) != -1);
-	free(iter);
-	return nt;
-}
-
-f32 _exp(f32 x) { return (f32) exp(x); }
-f32 _log(f32 x) { return (f32) log(x); }
-tensor *tensor_exp(tensor *t) { return tensor_apply_unop(t, &_exp); }
-tensor *tensor_log(tensor *t) { return tensor_apply_unop(t, &_log); }
+f32 _exp(f32 x, i32 _) { return (f32) exp(x); }
+f32 _log(f32 x, i32 _) { return (f32) log(x); }
+f32 _pow(f32 x, i32 n) { return (f32) powf(x, n); }
+tensor *tensor_exp(tensor *t) { return tensor_apply_unop(t, &_exp, -1); }
+tensor *tensor_log(tensor *t) { return tensor_apply_unop(t, &_log, -1); }
+tensor *tensor_pow(tensor *t, f32 n) { return tensor_apply_unop(t, &_pow, n); }
 tensor *tensor_sqrt(tensor *t) { return tensor_pow(t, 0.5); }
 
 /*
@@ -238,7 +226,9 @@ tensor *tensor_apply_reduceop(tensor *t, int axis, void (*op)(f32*, f32)) {
 }
 
 void __sum(f32 *a, f32 b) { *a += b; }
+void __max(f32 *a, f32 b) { *a = *a > b ? *a : b; }
 tensor *tensor_sum(tensor *t, int axis) { return tensor_apply_reduceop(t, axis, &__sum); }
+tensor *tensor_max(tensor *t, int axis) { return tensor_apply_reduceop(t, axis, &__max); }
 tensor *tensor_mean(tensor *t, int axis) { return tensor_div_scalar(tensor_sum(t, axis), t->shape[axis]); }
 
 /*
