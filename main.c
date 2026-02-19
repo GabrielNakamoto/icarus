@@ -1,6 +1,14 @@
 #include <stdio.h>
 #include "icarus.h"
 
+void print_2d_tensor(tensor *t) {
+	for (int i=0; i<t->shape[0]; ++i) {
+		for (int j=0; j<t->shape[1]; ++j) printf("%.2f ", t->data[j + i*t->shape[1]]);
+		printf("\n");
+	}
+	printf("\n");
+}
+
 int main(int argc, char **argv) {
 	int shape_a[2] = { 3, 2 };
 	int shape_b[2] = { 2, 3 };
@@ -12,10 +20,11 @@ int main(int argc, char **argv) {
 	memcpy(a->data, data_a, 6 * sizeof(f32));
 	memcpy(b->data, data_b, 6 * sizeof(f32));
 
-	tensor *c = tensor_gemm(a, b);
+	print_2d_tensor(a);
+	print_2d_tensor(b);
 
-	print_shape(c);
-	for (int i=0; i<9; ++i) {
-		printf("%f ", c->data[i]);
-	}
+	tensor *c = tensor_gemm(a, b);
+	tensor *d = tensor_mul_scalar(c, 0.5);
+
+	print_2d_tensor(c);
 }

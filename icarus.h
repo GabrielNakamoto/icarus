@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,6 @@ tensor *tensor_mul(tensor *a, tensor *b);
 tensor *tensor_add(tensor *a, tensor *b);
 
 // Reduce Ops
-tensor *tensor_reduce(tensor *t, i32 axis);
 tensor *tensor_sum(tensor *t, i32 axis);
 
 // Composed Ops
@@ -85,7 +85,9 @@ f32 *tensor_getitem(tensor *t, int *strides, int *indices) {
 	return t->data + tensor_getidx(strides, t->ndims, indices);
 }
 
-
+/*
+ * Reshape Ops
+ */
 tensor *tensor_reshape(tensor *t, int *newshape, int ndims) {
 	if (get_size(newshape, ndims) != get_size(t->shape, t->ndims)) return NULL;
 
@@ -101,11 +103,51 @@ tensor *tensor_reshape(tensor *t, int *newshape, int ndims) {
 }
 
 /*
+* Unary Elementwise Ops
+*/
+tensor *tensor_apply_unop(tensor *t, f32 (*op)(f32)) {
+	tensor *nt = alloc_tensor(t->shape, t->ndims);
+	i32 *iter = (i32*) malloc(t->ndims * sizeof(i32));
+	memset(iter, 0, t->ndims * sizeof(i32));
+
+	do {
+		f32 *a = tensor_getitem(t, t->strides, iter);
+		f32 *b = tensor_getitem(nt, nt->strides, iter);
+		*b = op(*a);
+	} while(inc_shapeindex(iter, t->shape, t->ndims) != -1);
+	free(iter);
+	return nt;
+}
+
+// TODO: redundant? restructure like exp / log
+tensor *tensor_pow(tensor *t, f32 n) {
+	tensor *nt = alloc_tensor(t->shape, t->ndims);
+	i32 *iter = (i32*) malloc(t->ndims * sizeof(i32));
+	memset(iter, 0, t->ndims * sizeof(i32));
+
+	do {
+		f32 *a = tensor_getitem(t, t->strides, iter);
+		f32 *b = tensor_getitem(nt, nt->strides, iter);
+		*b = powf(*a, n);
+	} while(inc_shapeindex(iter, t->shape, t->ndims) != -1);
+	free(iter);
+	return nt;
+}
+
+f32 _exp(f32 x) { return (f32) exp(x); }
+f32 _log(f32 x) { return (f32) log(x); }
+tensor *tensor_exp(tensor *t) { return tensor_apply_unop(t, &_exp); }
+tensor *tensor_log(tensor *t) { return tensor_apply_unop(t, &_log); }
+tensor *tensor_sqrt(tensor *t) { return tensor_pow(t, 0.5); }
+
+/*
 * Binary Elementwise Ops
 */
 tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*op)(f32, f32)) {
+	if (a->ndims != b->ndims) return NULL;
 	i32 *cshape = broadcast_shape(a->shape, b->shape, a->ndims);
 	tensor *c = alloc_tensor(cshape, a->ndims);
+	free(cshape);
 
 	i32 *a_bstrides = broadcast_strides(a); i32 *b_bstrides = broadcast_strides(b);
 	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
@@ -118,22 +160,32 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*op)(f32, f32)) {
 		*cv = op(*av, *bv);
 	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
 
-	free(cshape);
+	return c;
+}
+
+tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*op)(f32, f32)) {
+	tensor *c = alloc_tensor(a->shape, a->ndims);
+
+	i32 *a_bstrides = broadcast_strides(a);
+	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
+	memset(iter, 0, a->ndims * sizeof(i32));
+
+	do {
+		f32 *av = tensor_getitem(a, a_bstrides, iter);
+		f32 *cv = tensor_getitem(c, c->strides, iter);
+		*cv = op(*av, b);
+	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
+
 	return c;
 }
 
 f32 _mul(f32 a, f32 b) { return a * b; }
-tensor *tensor_mul(tensor *a, tensor *b) {
-	if (a->ndims != b->ndims) return NULL;
-	return tensor_apply_biop(a, b, &_mul);
-}
+tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &_mul); }
+tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &_mul); }
 
 f32 _add(f32 a, f32 b) { return a + b; }
-tensor *tensor_add(tensor *a, tensor *b) {
-	if (a->ndims != b->ndims) return NULL;
-	return tensor_apply_biop(a, b, &_mul);
-}
-
+tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &_add); }
+tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &_add); }
 
 /*
 * Reduce Ops
