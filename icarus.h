@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define MAX_TOPO_NODES 1024
+
 typedef float f32;
 typedef int i32;
 
@@ -117,7 +119,7 @@ void print_2d_tensor(tensor *t) {
 
 
 // Helper funcs
-i32 get_size(i32 *shape, i32 ndims) {
+static i32 get_size(i32 *shape, i32 ndims) {
 	i32 size = 1;
 	for (i32 i=0; i<ndims; ++i) size *= shape[i];
 	return size;
@@ -349,9 +351,29 @@ tensor *tensor_softmax(tensor *t) {
 /*
 * Back Prop / Autograd
 */
+
+void topo_dfs(tensor *t, tensor **topo, tensor **seen, i32 *n, i32 *ns) {
+	for (i32 i=0; i<*ns; ++i) if (seen[i] == t) return;
+	seen[(*ns)++]=t;
+	if (t->parent_l.type == TENSOR) topo_dfs((tensor*) t->parent_l.value.t, topo, seen, n, ns);
+	if (t->parent_r.type == TENSOR) topo_dfs((tensor*) t->parent_r.value.t, topo, seen, n, ns);
+	topo[(*n)++]=t;
+}
+
 tensor *tensor_backward(tensor *t) {
-	// TODO: How to toposort without using dynamic array?
-	// - Maybe i have to...
+	tensor *topo[MAX_TOPO_NODES], *seen[MAX_TOPO_NODES];
+	i32 n =0, ns = 0;
+	topo_dfs(t, topo, seen, &n, &ns);
+
+	int root_size = get_size(t->shape, t->ndims);
+	t->grad = (f32*)malloc(root_size * sizeof(f32));
+	memset(t->grad, 1.0f, root_size * sizeof(f32));
+
+	for (i32 i=n-1; i>=0; i--) {
+		tensor *node = topo[i];
+		switch (node->parent_op) {
+		}
+	}
 }
 
 tensor *alloc_tensor(i32 *shape, i32 ndims) {
