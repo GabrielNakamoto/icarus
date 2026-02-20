@@ -6,9 +6,9 @@ Goal: > 95% MNIST test accuracy raw c
 
 To implement:
 - [ ] memory management
-- [ ] basic ops
-- [ ] reshape ops
-- [ ] reduce ops
+- [x] basic ops
+- [x] reshape ops
+- [x] reduce ops
 - [ ] nn ops 
 - [ ] back prop
 - [ ] layers (Conv2d, BatchNorm, Linear)
