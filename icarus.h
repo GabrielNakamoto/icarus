@@ -384,11 +384,9 @@ tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 }
 
 tensor *_unbroadcast_grad(tensor *g, tensor *parent) {
-	for (int i=0; i<parent->ndims; i++) {
-		if (parent->shape[i] == 1 && g->shape[i] > 1) {
+	for (int i=0; i<parent->ndims; i++)
+		if (parent->shape[i] == 1 && g->shape[i] > 1)
 			g = tensor_sum(g, i, true);
-		}
-	}
 	return g;
 }
 
@@ -405,11 +403,8 @@ tensor *tensor_backward(tensor *t) {
 		try_init_parent_grad(&node->parent_l);
 
 		tensor *g = (tensor*)node->grad;
-		f32 pow; tensor *lp; tensor *lg; tensor *contrib;
-		tensor *mask; tensor *max_broadcast;
-
-
-		printf("Computing grade for node %d, op->%s\n", i, op_names[node->parent_op]);
+		f32 pow; tensor *lp; tensor *lg;
+		tensor *contrib; tensor *mask; tensor *max_broadcast;
 
 		if (node->parent_op != NEW) {
 			lp = (tensor*)node->parent_l.value.t;
@@ -417,10 +412,7 @@ tensor *tensor_backward(tensor *t) {
 			contrib = duplicate_tensor(lg);
 		}
 		switch (node->parent_op) {
-			case NEW: 
-				if (node->free_after_grad)
-					free(node);
-				continue;
+			case NEW: if (node->free_after_grad) free(node); continue;
 			case RESHAPE: lp->grad = tensor_reshape(g, lp->shape, lp->ndims); break;
 			case POW: lp->grad = tensor_mul(g, tensor_mul_scalar(tensor_pow(lp, node->grad_arg-1), node->grad_arg)); break;
 			case EXP: lp->grad = tensor_mul(g, node); break;
@@ -449,17 +441,14 @@ tensor *tensor_backward(tensor *t) {
 					lp->grad = _unbroadcast_grad(tensor_mul_scalar(g, node->parent_r.value.s), lp);
 				}
 				break;
-			case SUM:
-				lp->grad = _unreduce_tensor(g, node, lp); break;
+			case SUM: lp->grad = _unreduce_tensor(g, node, lp); break;
 			case MAX:
 				lp->grad = _unreduce_tensor(g, node, lp);
 				mask = tensor_eq(_unreduce_tensor(node, node, lp), lp);
 				lp->grad = tensor_mul((tensor*)lp->grad, mask);
 				break;
 			case RELU: lp->grad = tensor_mul(g, _tensor_reluback(lp)); break;
-			default:
-				continue;
-				break;
+			default: continue; break;
 		}
 		lp->grad = tensor_add((tensor*)lp->grad, contrib);
 	}
