@@ -9,6 +9,7 @@ typedef int i32;
 
 typedef enum {
 	NEW,
+	RESHAPE,
 	POW, EXP, LOG,
 	MUL, ADD,
 	SUM, MAX,
@@ -17,18 +18,36 @@ typedef enum {
 } tensor_op;
 
 const char* const op_names[] = {
-    "NEW", "POW", "EXP", "LOG", "MUL",
+    "NEW", "RESHAPE", "POW", "EXP", "LOG", "MUL",
 		"ADD", "SUM", "MAX", "GEMM", "RELU",
 };
 
+typedef union {
+	void *t;
+	f32 s;
+} tensor_parents_value;
+
+typedef enum {
+	TENSOR,
+	SCALAR,
+	NONE
+} tensor_parent_type;
 
 typedef struct {
+	tensor_parents_value value;
+	tensor_parent_type type;
+} tensor_parent;
+
+typedef struct {
+	tensor_parent parent_r;
+	tensor_parent parent_l;
 	tensor_op parent_op;
 	i32 ndims;
 	i32 *shape;
 	i32 *strides;
 	f32 *data;
 } tensor;
+
 
 tensor *alloc_tensor(i32 *shape, i32 ndims);
 f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
@@ -63,6 +82,9 @@ tensor *tensor_max(tensor *t, i32 axis, bool keepdims);
 tensor *tensor_gemm(tensor *a, tensor *b);
 tensor *tensor_softmax(tensor *t);
 tensor *tensor_relu(tensor *t);
+
+// CNN Ops
+tensor *tensor_im2col(tensor *im, int kh, int kw, int sh, int sw, int ph, int pw);
 
 void print_shape(tensor *t) {
 	printf("(");
@@ -154,6 +176,10 @@ tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 tensor *tensor_apply_unop(tensor *t, f32 (*func)(f32, f32), f32 arg, tensor_op op) {
 	tensor *nt = alloc_tensor(t->shape, t->ndims);
 	nt->parent_op = op;
+	nt->parent_l.type = TENSOR;
+	nt->parent_l.value.t = t;
+	nt->parent_r.type = NONE;
+
 	i32 *iter = (i32*) malloc(t->ndims * sizeof(i32));
 	memset(iter, 0, t->ndims * sizeof(i32));
 
@@ -176,12 +202,6 @@ tensor *tensor_sqrt(tensor *t) { return tensor_pow(t, 0.5); }
 
 f32 _relu(f32 x, f32 _) { return x > 0 ? x : 0; }
 tensor *tensor_relu(tensor *t) { return tensor_apply_unop(t, &_relu, -1, RELU); }
-tensor *tensor_softmax(tensor *t) {
-	tensor *max = tensor_max(t, 1, true);
-	tensor *top = tensor_exp(tensor_sub(t, max));
-	tensor *bottom = tensor_sum(top, 1, true);
-	return tensor_div(top, bottom);
-}
 
 /*
 * Binary Elementwise Ops
@@ -190,8 +210,13 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 	if (a->ndims != b->ndims) return NULL;
 	i32 *cshape = broadcast_shape(a->shape, b->shape, a->ndims);
 	tensor *c = alloc_tensor(cshape, a->ndims);
-	c->parent_op = op;
 	free(cshape);
+
+	c->parent_op = op;
+	c->parent_l.type = TENSOR;
+	c->parent_l.value.t = a;
+	c->parent_r.type = TENSOR;
+	c->parent_r.value.t = b;
 
 	i32 *a_bstrides = broadcast_strides(a); i32 *b_bstrides = broadcast_strides(b);
 	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
@@ -203,22 +228,30 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 		f32 *cv = tensor_getitem(c, c->strides, iter);
 		*cv = func(*av, *bv);
 	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
+	free(iter);
 
 	return c;
 }
 
-tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*op)(f32, f32)) {
+tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*func)(f32, f32), tensor_op op) {
 	tensor *c = alloc_tensor(a->shape, a->ndims);
 
 	i32 *a_bstrides = broadcast_strides(a);
 	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
 	memset(iter, 0, a->ndims * sizeof(i32));
 
+	c->parent_op = op;
+	c->parent_l.type = TENSOR;
+	c->parent_l.value.t = a;
+	c->parent_r.type = SCALAR;
+	c->parent_r.value.s = b;
+
 	do {
 		f32 *av = tensor_getitem(a, a_bstrides, iter);
 		f32 *cv = tensor_getitem(c, c->strides, iter);
-		*cv = op(*av, b);
+		*cv = func(*av, b);
 	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
+	free(iter);
 
 	return c;
 }
@@ -229,9 +262,9 @@ tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__mul
 tensor *tensor_div(tensor *a, tensor *b) { return tensor_mul(a, tensor_pow(b, -1)); }
 tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__add, ADD); }
 tensor *tensor_sub(tensor *a, tensor *b) { return tensor_add(a, tensor_mul_scalar(b, -1)); }
-tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__mul); }
+tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__mul, MUL); }
 tensor *tensor_div_scalar(tensor *a, f32 b) { return tensor_mul_scalar(a, 1.0 / b); }
-tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add); }
+tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add, ADD); }
 tensor *tensor_sub_scalar(tensor *a, f32 b) { return tensor_add_scalar(a, b * -1); }
 
 /*
@@ -249,7 +282,11 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 	}
 
 	tensor *r = alloc_tensor(nshape, keepdims ? t->ndims : t->ndims-1);
+
 	r->parent_op = op;
+	r->parent_l.type = TENSOR;
+	r->parent_l.value.t = &t;
+	r->parent_l.type = NONE;
 
 	i32 *riter = (i32*)malloc(r->ndims * sizeof(i32));
 	i32 *iter = (i32*)malloc(t->ndims * sizeof(i32));
@@ -291,9 +328,19 @@ tensor *tensor_gemm(tensor *a, tensor *b) {
 	b = tensor_reshape(b, bsh, 3);
 
 	tensor *c = tensor_mul(a, b);
-
 	return tensor_sum(c, 1, false);
 }
+
+tensor *tensor_softmax(tensor *t) {
+	tensor *max = tensor_max(t, 1, true);
+	tensor *top = tensor_exp(tensor_sub(t, max));
+	tensor *bottom = tensor_sum(top, 1, true);
+	return tensor_div(top, bottom);
+}
+
+/*
+* CNN Ops
+*/
 
 tensor *alloc_tensor(i32 *shape, i32 ndims) {
 	i32 size = get_size(shape, ndims);
