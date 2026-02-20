@@ -174,7 +174,7 @@ tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 	tensor *nt = alloc_tensor(newshape, ndims, 0, RESHAPE);
 	nt->parent_l.type = TENSOR; nt->parent_l.value.t = t;
 	memcpy(nt->data, t->data, get_size(t->shape, t->ndims) * sizeof(f32));
-return nt;
+	return nt;
 }
 
 /*
@@ -355,75 +355,97 @@ void try_init_parent_grad(tensor_parent *parent) {
 	t->grad = alloc_tensor(t->shape, t->ndims, 0, NEW);
 }
 
-tensor *unbroadcast_grad(tensor *node, tensor *parent) {
+tensor *_unreduce_grad(tensor *node, tensor *parent) {
 	tensor *g = (tensor*) node->grad;
 	tensor *pg = (tensor*) parent->grad;
 	i32 axis = node->grad_arg;
 
-	// 1. Reshape g
-	// 2. Broadcast strides
-	// 3. Copy over from parent
-
-	/*
-	if (g->ndims < parent->ndims) {
+	if (! node->grad_keptdims) {
 		i32 *nshape = (i32*) malloc(parent->ndims * sizeof(i32));
 		nshape[axis]=1;
 		for (int i=0; i<axis; ++i) nshape[i]=parent->shape[i];
 		for (int i=axis+1; i<parent->ndims; ++i) nshape[i]=parent->shape[i];
 		g = tensor_reshape(g, nshape, parent->ndims);
+		free(nshape);
+	}
 
-		i32 *bstrides = broadcast_strides(g);
-		i32 *indices = (i32*) malloc(parent->ndims * sizeof(i32));
-		memset(indices, 0, parent->ndims * sizeof(i32));
-		do {
-		} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
-	}*/
+	i32 *bstrides = broadcast_strides(g);
+	i32 *indices = (i32*) malloc(parent->ndims * sizeof(i32));
+	memset(indices, 0, parent->ndims * sizeof(i32));
+	do {
+		f32 *pv = tensor_getitem(pg, parent->strides, indices);
+		*pv = *tensor_getitem(g, bstrides, indices);
+	} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
+	free(indices);
+	free(bstrides);
+	return g;
 }
 
-// TODO: unbroadcast grad function
+tensor *_unbroadcast_grad(tensor *g, tensor *parent) {
+	for (int i=0; i<parent->ndims; i++) {
+		if (parent->shape[i] == 1 && g->shape[i] > 1) {
+			g = tensor_sum(g, i, true);
+		}
+	}
+	return g;
+}
+
 tensor *tensor_backward(tensor *t) {
 	tensor *topo[MAX_TOPO_NODES], *seen[MAX_TOPO_NODES];
 	i32 n =0, ns = 0;
 	topo_dfs(t, topo, seen, &n, &ns);
 
 	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW);
-for (i32 i=n-1; i>0; i--) {
+	for (i32 i=n-1; i>0; i--) {
 		tensor *node = topo[i];
-		printf("Node: %d\tOp: %s\n", i, op_names[node->parent_op]);
 
 		try_init_parent_grad(&node->parent_r);
 		try_init_parent_grad(&node->parent_l);
 
 		tensor *g = (tensor*)node->grad;
-		f32 pow;
-		print_2d_tensor(g);
+		f32 pow; tensor *lp; tensor *lg;
 
-		tensor *lp = (tensor*)node->parent_l.value.t;
-		tensor *lg = (tensor*)lp->grad;
+		printf("Computing grade for node %d, op->%s\n", i, op_names[node->parent_op]);
+		print_shape(g);
+
+		if (node->parent_op != NEW) {
+			lp = (tensor*)node->parent_l.value.t;
+			lg = (tensor*)lp->grad;
+		}
 		switch (node->parent_op) {
-			case NEW: memcpy(lg->data, g->data, get_size(lp->shape, lp->ndims) * sizeof(f32)); break;
+			case NEW: 
+				if (node->free_after_grad)
+					free(node);
+				break;
 			case RESHAPE: lp->grad = tensor_reshape(g, lp->shape, lp->ndims); break;
 			case POW: lp->grad = tensor_mul(g, tensor_mul_scalar(tensor_pow(lp, node->grad_arg-1), node->grad_arg)); break;
-			case EXP: lp->grad = tensor_mul(g, lp); break;
+			case EXP: lp->grad = tensor_mul(g, node); break;
 			case LOG: lp->grad = tensor_mul(g, tensor_pow(lp, -1)); break;
 			case ADD:
-				memcpy(lg->data, g->data, get_size(node->shape, node->ndims) * sizeof(f32));
 				if (node->parent_r.type == TENSOR) {
 					tensor *rp = (tensor*)node->parent_r.value.t;
 					tensor *rg = (tensor*)rp->grad;
-					memcpy(rg->data, g->data, get_size(node->shape, node->ndims) * sizeof(f32));
+					tensor *g_r = _unbroadcast_grad(g, rp);
+					tensor *g_l = _unbroadcast_grad(g, lp);
+					memcpy(rg->data, g_r->data, get_size(node->shape, node->ndims) * sizeof(f32));
+					memcpy(lg->data, g_l->data, get_size(node->shape, node->ndims) * sizeof(f32));
+				} else {
+					tensor *g_l = _unbroadcast_grad(g, lp);
+					memcpy(lg->data, g_l->data, get_size(node->shape, node->ndims) * sizeof(f32));
 				}
 				break;	
 			case MUL:
 				if (node->parent_r.type == TENSOR) {
 					tensor *rp = (tensor*)node->parent_r.value.t;
-					lp->grad = tensor_mul(g, rp);
-					rp->grad = tensor_mul(g, lp);
+					tensor *gl = tensor_mul(g, rp);
+					tensor *gr = tensor_mul(g, lp);
+					lp->grad = _unbroadcast_grad(gl, lp);
+					rp->grad = _unbroadcast_grad(gr, rp);
 				} else {
-					lp->grad = tensor_mul_scalar(g, node->parent_r.value.s);
+					lp->grad = _unbroadcast_grad(tensor_mul_scalar(g, node->parent_r.value.s), lp);
 				}
 				break;
-			case SUM: break;
+			case SUM: _unreduce_grad(node, lp); break;
 			case MAX: break;
 			case RELU: lp->grad = tensor_mul(g, _tensor_reluback(lp)); break;
 			default: break;
