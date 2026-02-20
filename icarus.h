@@ -49,7 +49,8 @@ typedef struct {
 	tensor_parent parent_r;
 	tensor_parent parent_l;
 	tensor_op parent_op;
-	f32 *grad;
+	f32 grad_arg;
+	void *grad; // tensor
 
 	// Metadata
 	i32 ndims;
@@ -60,7 +61,7 @@ typedef struct {
 } tensor;
 
 
-tensor *alloc_tensor(i32 *shape, i32 ndims);
+tensor *alloc_tensor(i32 *shape, i32 ndims, i32 init);
 f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
 
 
@@ -172,23 +173,24 @@ i32 inc_shapeindex(i32 *indices, i32 *shape, i32 ndims) {
 tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 	if (get_size(newshape, ndims) != get_size(t->shape, t->ndims)) return NULL;
 
-	tensor *nt = alloc_tensor(newshape, ndims);
+	tensor *nt = alloc_tensor(newshape, ndims, 0);
 	nt->parent_op = RESHAPE;
 	nt->parent_l.type = TENSOR;
 	nt->parent_l.value.t = t;
 	memcpy(nt->data, t->data, get_size(t->shape, t->ndims) * sizeof(f32));
-	return nt;
+return nt;
 }
 
 /*
 * Unary Elementwise Ops
 */
 tensor *tensor_apply_unop(tensor *t, f32 (*func)(f32, f32), f32 arg, tensor_op op) {
-	tensor *nt = alloc_tensor(t->shape, t->ndims);
+	tensor *nt = alloc_tensor(t->shape, t->ndims, 0);
 	nt->parent_op = op;
 	nt->parent_l.type = TENSOR;
 	nt->parent_l.value.t = t;
 	nt->parent_r.type = NONE;
+	nt->grad_arg = arg;
 
 	i32 *iter = (i32*) malloc(t->ndims * sizeof(i32));
 	memset(iter, 0, t->ndims * sizeof(i32));
@@ -219,7 +221,7 @@ tensor *tensor_relu(tensor *t) { return tensor_apply_unop(t, &_relu, -1, RELU); 
 tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op op) {
 	if (a->ndims != b->ndims) return NULL;
 	i32 *cshape = broadcast_shape(a->shape, b->shape, a->ndims);
-	tensor *c = alloc_tensor(cshape, a->ndims);
+	tensor *c = alloc_tensor(cshape, a->ndims, 0);
 	free(cshape);
 
 	c->parent_op = op;
@@ -244,7 +246,7 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 }
 
 tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*func)(f32, f32), tensor_op op) {
-	tensor *c = alloc_tensor(a->shape, a->ndims);
+	tensor *c = alloc_tensor(a->shape, a->ndims, 0);
 
 	i32 *a_bstrides = broadcast_strides(a);
 	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
@@ -291,7 +293,7 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 		for (i32 i=0; i<t->ndims; ++i) nshape[i] = i == axis ? 1 : t->shape[i];
 	}
 
-	tensor *r = alloc_tensor(nshape, keepdims ? t->ndims : t->ndims-1);
+	tensor *r = alloc_tensor(nshape, keepdims ? t->ndims : t->ndims-1, 0);
 
 	r->parent_op = op;
 	r->parent_l.type = TENSOR;
@@ -351,7 +353,6 @@ tensor *tensor_softmax(tensor *t) {
 /*
 * Back Prop / Autograd
 */
-
 void topo_dfs(tensor *t, tensor **topo, tensor **seen, i32 *n, i32 *ns) {
 	for (i32 i=0; i<*ns; ++i) if (seen[i] == t) return;
 	seen[(*ns)++]=t;
@@ -360,23 +361,71 @@ void topo_dfs(tensor *t, tensor **topo, tensor **seen, i32 *n, i32 *ns) {
 	topo[(*n)++]=t;
 }
 
+
+void try_init_parent_grad(tensor_parent *parent) {
+	if (parent->type != TENSOR) return;
+	tensor *t = (tensor*)parent->value.t;
+	if (t->grad != NULL) return;
+	t->grad = alloc_tensor(t->shape, t->ndims, 0);
+}
+// TODO: unbroadcast grad function
 tensor *tensor_backward(tensor *t) {
 	tensor *topo[MAX_TOPO_NODES], *seen[MAX_TOPO_NODES];
 	i32 n =0, ns = 0;
 	topo_dfs(t, topo, seen, &n, &ns);
 
-	int root_size = get_size(t->shape, t->ndims);
-	t->grad = (f32*)malloc(root_size * sizeof(f32));
-	memset(t->grad, 1.0f, root_size * sizeof(f32));
-
+	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f);
 	for (i32 i=n-1; i>=0; i--) {
 		tensor *node = topo[i];
+		try_init_parent_grad(&node->parent_r);
+		try_init_parent_grad(&node->parent_l);
+
+		tensor *g = (tensor*)node->grad;
+		tensor *lp = (tensor*)node->parent_l.value.t;
+		f32 pow;
 		switch (node->parent_op) {
+			case RESHAPE:
+				lp->grad = tensor_reshape(g, lp->shape, lp->ndims);
+				break;
+			case POW:
+				pow = node->grad_arg;
+				lp->grad = tensor_mul(g, tensor_mul_scalar(tensor_pow(lp, pow-1), pow));
+				break;
+			case EXP:
+				lp->grad = tensor_mul(g, lp);
+				break;
+			case LOG:
+				lp->grad = tensor_mul(g, tensor_pow(lp, -1));
+				break;
+			case ADD:
+				memcpy(lp->grad, node->grad, get_size(node->shape, node->ndims) * sizeof(f32));
+				if (node->parent_r.type == TENSOR) {
+					tensor *rp = (tensor*)node->parent_r.value.t;
+					memcpy(rp->grad, node->grad, get_size(node->shape, node->ndims) * sizeof(f32));
+				}
+				break;	
+			case MUL:
+				if (node->parent_r.type == TENSOR) {
+					tensor *rp = (tensor*)node->parent_r.value.t;
+					lp->grad = tensor_mul(g, rp);
+					rp->grad = tensor_mul(g, lp);
+				} else {
+					lp->grad = tensor_mul_scalar(g, node->parent_r.value.s);
+				}
+				break;
+			case SUM:
+				break;
+			case MAX:
+				break;
+			case RELU:
+				break;
+			default:
+				break;
 		}
 	}
 }
 
-tensor *alloc_tensor(i32 *shape, i32 ndims) {
+tensor *alloc_tensor(i32 *shape, i32 ndims, i32 init) {
 	i32 size = get_size(shape, ndims);
 
 	tensor *t = (tensor*) malloc(sizeof(tensor));
@@ -386,13 +435,14 @@ tensor *alloc_tensor(i32 *shape, i32 ndims) {
 
 	calculate_strides(shape, ndims, &strides);
 
-	memset(data, 0, size * sizeof(f32));
+	memset(data, init, size * sizeof(f32));
 	memcpy(nshape, shape, ndims * sizeof(i32));
 
 	t->parent_op = NEW;
 	t->parent_l.type = NONE;
 	t->parent_r.type = NONE;
 	t->data = data;
+	t->grad = NULL;
 	t->ndims = ndims;
 	t->shape = nshape;
 	t->strides = strides;
