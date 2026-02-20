@@ -33,18 +33,27 @@ typedef enum {
 	NONE
 } tensor_parent_type;
 
+const char* const parent_type_names[] = {
+	"TENSOR", "SCALAR", "NONE"
+};
+
 typedef struct {
 	tensor_parents_value value;
 	tensor_parent_type type;
 } tensor_parent;
 
 typedef struct {
+	// Autograd fields
 	tensor_parent parent_r;
 	tensor_parent parent_l;
 	tensor_op parent_op;
+	f32 *grad;
+
+	// Metadata
 	i32 ndims;
 	i32 *shape;
 	i32 *strides;
+
 	f32 *data;
 } tensor;
 
@@ -97,6 +106,8 @@ void print_shape(tensor *t) {
 
 void print_2d_tensor(tensor *t) {
 	printf("Op->%s\n", op_names[t->parent_op]);
+	printf("Left Parent->%s\n", parent_type_names[t->parent_l.type]);
+	printf("Right Parent->%s\n", parent_type_names[t->parent_r.type]);
 	for (int i=0; i<t->shape[0]; ++i) {
 		for (int j=0; j<t->shape[1]; ++j) printf("%.4f ", t->data[j + i*t->shape[1]]);
 		printf("\n");
@@ -159,15 +170,12 @@ i32 inc_shapeindex(i32 *indices, i32 *shape, i32 ndims) {
 tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 	if (get_size(newshape, ndims) != get_size(t->shape, t->ndims)) return NULL;
 
-	if (ndims > t->ndims) {
-		t->shape = (i32*) realloc(t->shape, ndims * sizeof(i32));
-		t->strides = (i32*) realloc(t->strides, ndims * sizeof(i32));
-	}
-	t->ndims = ndims;
-	memcpy(t->shape, newshape, ndims * sizeof(i32));
-
-	calculate_strides(t->shape, ndims, &t->strides);
-	return t;
+	tensor *nt = alloc_tensor(newshape, ndims);
+	nt->parent_op = RESHAPE;
+	nt->parent_l.type = TENSOR;
+	nt->parent_l.value.t = t;
+	memcpy(nt->data, t->data, get_size(t->shape, t->ndims) * sizeof(f32));
+	return nt;
 }
 
 /*
@@ -286,7 +294,7 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 	r->parent_op = op;
 	r->parent_l.type = TENSOR;
 	r->parent_l.value.t = &t;
-	r->parent_l.type = NONE;
+	r->parent_r.type = NONE;
 
 	i32 *riter = (i32*)malloc(r->ndims * sizeof(i32));
 	i32 *iter = (i32*)malloc(t->ndims * sizeof(i32));
@@ -339,8 +347,12 @@ tensor *tensor_softmax(tensor *t) {
 }
 
 /*
-* CNN Ops
+* Back Prop / Autograd
 */
+tensor *tensor_backward(tensor *t) {
+	// TODO: How to toposort without using dynamic array?
+	// - Maybe i have to...
+}
 
 tensor *alloc_tensor(i32 *shape, i32 ndims) {
 	i32 size = get_size(shape, ndims);
@@ -356,6 +368,8 @@ tensor *alloc_tensor(i32 *shape, i32 ndims) {
 	memcpy(nshape, shape, ndims * sizeof(i32));
 
 	t->parent_op = NEW;
+	t->parent_l.type = NONE;
+	t->parent_r.type = NONE;
 	t->data = data;
 	t->ndims = ndims;
 	t->shape = nshape;

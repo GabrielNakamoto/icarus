@@ -10,7 +10,6 @@ int main(int argc, char **argv) {
 	tensor *b = alloc_tensor(shape_b, 2);
 	memcpy(a->data, data_a, 6 * sizeof(f32));
 	memcpy(b->data, data_b, 6 * sizeof(f32));
-	tensor *d = tensor_softmax(b);
 
 	print_2d_tensor(a);
 	print_2d_tensor(b);
@@ -18,5 +17,6 @@ int main(int argc, char **argv) {
 	tensor *c = tensor_gemm(a, b);
 	print_2d_tensor(c);
 
+	tensor *d = tensor_softmax(b);
 	print_2d_tensor(d);
 }
