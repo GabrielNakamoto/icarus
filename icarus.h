@@ -61,6 +61,7 @@ typedef struct {
 
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op);
+tensor *duplicate_tensor(tensor *t);
 f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
 
 // Reshape Ops
@@ -329,13 +330,9 @@ tensor *tensor_gemm(tensor *a, tensor *b) {
 
 tensor *tensor_softmax(tensor *t) {
 	tensor *max = tensor_max(t, 1, true);
-	max->free_after_grad = true;
 	t = tensor_sub(t, max);
-	t->free_after_grad = true;
 	t = tensor_exp(t);
-	t->free_after_grad = true;
 	tensor *bottom = tensor_sum(t, 1, true);
-	bottom->free_after_grad = true;
 	return tensor_div(t, bottom);
 }
 
@@ -361,7 +358,7 @@ void try_init_parent_grad(tensor_parent *parent) {
 tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 	tensor *g = alloc_tensor(node->shape, node->ndims, 0, NEW);
 	memcpy(g->data, from->data, get_size(g->shape, g->ndims) * sizeof(f32));
-	tensor *pg = (tensor*) parent->grad;
+	tensor *pg = alloc_tensor(parent->shape, parent->ndims, 0, NEW);
 	i32 axis = node->grad_arg;
 
 	if (! node->grad_keptdims) {
@@ -382,7 +379,8 @@ tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 	} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
 	free(indices);
 	free(bstrides);
-	return g;
+	free(g);
+	return pg;
 }
 
 tensor *_unbroadcast_grad(tensor *g, tensor *parent) {
@@ -407,21 +405,22 @@ tensor *tensor_backward(tensor *t) {
 		try_init_parent_grad(&node->parent_l);
 
 		tensor *g = (tensor*)node->grad;
-		f32 pow; tensor *lp; tensor *lg;
+		f32 pow; tensor *lp; tensor *lg; tensor *contrib;
 		tensor *mask; tensor *max_broadcast;
 
+
 		printf("Computing grade for node %d, op->%s\n", i, op_names[node->parent_op]);
-		print_shape(g);
 
 		if (node->parent_op != NEW) {
 			lp = (tensor*)node->parent_l.value.t;
 			lg = (tensor*)lp->grad;
+			contrib = duplicate_tensor(lg);
 		}
 		switch (node->parent_op) {
 			case NEW: 
 				if (node->free_after_grad)
 					free(node);
-				break;
+				continue;
 			case RESHAPE: lp->grad = tensor_reshape(g, lp->shape, lp->ndims); break;
 			case POW: lp->grad = tensor_mul(g, tensor_mul_scalar(tensor_pow(lp, node->grad_arg-1), node->grad_arg)); break;
 			case EXP: lp->grad = tensor_mul(g, node); break;
@@ -458,9 +457,25 @@ tensor *tensor_backward(tensor *t) {
 				lp->grad = tensor_mul((tensor*)lp->grad, mask);
 				break;
 			case RELU: lp->grad = tensor_mul(g, _tensor_reluback(lp)); break;
-			default: break;
+			default:
+				continue;
+				break;
 		}
+		lp->grad = tensor_add((tensor*)lp->grad, contrib);
 	}
+}
+
+tensor *duplicate_tensor(tensor *t) {
+	tensor *nt = (tensor*) malloc(sizeof(tensor));
+	memcpy(nt, t, sizeof(tensor));
+
+	nt->data = (f32*)malloc(get_size(t->shape, t->ndims) * sizeof(f32));
+	nt->shape = (i32*)malloc(t->ndims * sizeof(i32));
+	nt->strides = (i32*)malloc(t->ndims * sizeof(i32));
+	memcpy(nt->data, t->data, get_size(t->shape, t->ndims) * sizeof(f32));
+	memcpy(nt->shape, t->shape, t->ndims * sizeof(i32));
+	memcpy(nt->strides, t->strides, t->ndims * sizeof(i32));
+	return nt;
 }
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op) {
