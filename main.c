@@ -15,12 +15,16 @@ int main(int argc, char **argv) {
 	print_2d_tensor(b);
 
 	// tensor *c = tensor_add(b, tensor_mul_scalar(tensor_relu(a), 0.75));
+	/*
 	tensor *c = tensor_gemm(a, b);
-	print_2d_tensor(c);
-	tensor_backward(c);
+	print_2d_tensor(c);*/
+	tensor *d = tensor_softmax(a);
+	print_2d_tensor(d);
+	tensor_backward(d);
 
 	printf("A grad\n");
 	print_2d_tensor(a->grad);
+	/*
 	printf("B grad\n");
-	print_2d_tensor(b->grad);
+	print_2d_tensor(b->grad);*/
 }

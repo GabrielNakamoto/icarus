@@ -252,14 +252,17 @@ tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*func)(f32, f32), tensor
 
 f32 __mul(f32 a, f32 b) { return a * b; }
 f32 __add(f32 a, f32 b) { return a + b; }
+f32 __eq(f32 a, f32 b) { return a == b ? 1 : 0; }
 tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__mul, MUL); }
 tensor *tensor_div(tensor *a, tensor *b) { return tensor_mul(a, tensor_pow(b, -1)); }
 tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__add, ADD); }
 tensor *tensor_sub(tensor *a, tensor *b) { return tensor_add(a, tensor_mul_scalar(b, -1)); }
+tensor *tensor_eq(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__eq, NEW); }
 tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__mul, MUL); }
 tensor *tensor_div_scalar(tensor *a, f32 b) { return tensor_mul_scalar(a, 1.0 / b); }
 tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add, ADD); }
 tensor *tensor_sub_scalar(tensor *a, f32 b) { return tensor_add_scalar(a, b * -1); }
+tensor *tensor_eq_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__eq, NEW); }
 
 /*
 * Reduce Ops
@@ -287,7 +290,7 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 
 	do {
 		if (!keepdims) {
-			for (i32 i=0; i<t->ndims; ++i) iter[i + (i >= axis)]=riter[i];
+			for (i32 i=0; i<r->ndims; ++i) iter[i + (i >= axis)]=riter[i];
 		} else memcpy(iter, riter, t->ndims * sizeof(i32));
 		f32 *a = tensor_getitem(r, r->strides, riter);
 		*a = init;
@@ -305,7 +308,7 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 void __sum(f32 *a, f32 b) { *a += b; }
 void __max(f32 *a, f32 b) { *a = *a > b ? *a : b; }
 tensor *tensor_sum(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__sum, 0, SUM); }
-tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -FP_INFINITE, MAX); }
+tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -INFINITY, MAX); }
 tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) { return tensor_div_scalar(tensor_sum(t, axis, keepdims), t->shape[axis]); }
 
 /*
@@ -355,8 +358,9 @@ void try_init_parent_grad(tensor_parent *parent) {
 	t->grad = alloc_tensor(t->shape, t->ndims, 0, NEW);
 }
 
-tensor *_unreduce_grad(tensor *node, tensor *parent) {
-	tensor *g = (tensor*) node->grad;
+tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
+	tensor *g = alloc_tensor(node->shape, node->ndims, 0, NEW);
+	memcpy(g->data, from->data, get_size(g->shape, g->ndims) * sizeof(f32));
 	tensor *pg = (tensor*) parent->grad;
 	i32 axis = node->grad_arg;
 
@@ -404,6 +408,7 @@ tensor *tensor_backward(tensor *t) {
 
 		tensor *g = (tensor*)node->grad;
 		f32 pow; tensor *lp; tensor *lg;
+		tensor *mask; tensor *max_broadcast;
 
 		printf("Computing grade for node %d, op->%s\n", i, op_names[node->parent_op]);
 		print_shape(g);
@@ -445,8 +450,13 @@ tensor *tensor_backward(tensor *t) {
 					lp->grad = _unbroadcast_grad(tensor_mul_scalar(g, node->parent_r.value.s), lp);
 				}
 				break;
-			case SUM: _unreduce_grad(node, lp); break;
-			case MAX: break;
+			case SUM:
+				lp->grad = _unreduce_tensor(g, node, lp); break;
+			case MAX:
+				lp->grad = _unreduce_tensor(g, node, lp);
+				mask = tensor_eq(_unreduce_tensor(node, node, lp), lp);
+				lp->grad = tensor_mul((tensor*)lp->grad, mask);
+				break;
 			case RELU: lp->grad = tensor_mul(g, _tensor_reluback(lp)); break;
 			default: break;
 		}
