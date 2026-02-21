@@ -1,14 +1,31 @@
-#include <atomic>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/types.h>
 
 #define MAX_TOPO_NODES 1024
+#define ARENA_SIZE 16*1024*1024
+#define ARENA_ALIGN 64
 
 typedef float f32;
 typedef int i32;
+typedef long u64;
+typedef char u8;
+
+static u8 arena_mem[ARENA_SIZE];
+static size_t arena_offset = 0;
+
+void arena_clear() { arena_offset = 0; }
+void *arena_alloc(u64 size) {
+	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
+	printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
+	if (arena_offset + padding + size > ARENA_SIZE) return NULL;
+	void *ptr = arena_mem + arena_offset + padding;
+	arena_offset += padding + size;
+	return ptr;
+}
 
 typedef enum {
 	NEW,
@@ -47,9 +64,8 @@ typedef struct {
 	tensor_parent parent_r, parent_l;
 	tensor_op parent_op;
 	f32 grad_arg;
-	bool grad_keptdims;
+	bool grad_keptdims, is_param;
 	void *grad; // tensor
-	bool free_after_grad;
 
 	// Metadata
 	i32 ndims;
@@ -59,7 +75,7 @@ typedef struct {
 } tensor;
 
 
-tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op);
+tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param);
 void free_tensor(tensor *t);
 tensor *duplicate_tensor(tensor *t);
 f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
@@ -75,14 +91,10 @@ tensor *tensor_sqrt(tensor *t);
 
 // Binary Ops
 tensor *tensor_mul(tensor *a, tensor *b);
+tensor *tensor_mul_scalar(tensor *a, f32 b);
 tensor *tensor_div(tensor *a, tensor *b);
 tensor *tensor_add(tensor *a, tensor *b);
 tensor *tensor_sub(tensor *a, tensor *b);
-
-tensor *tensor_mul_scalar(tensor *a, f32 b);
-tensor *tensor_div_scalar(tensor *a, f32 b);
-tensor *tensor_add_scalar(tensor *a, f32 b);
-tensor *tensor_sub_scalar(tensor *a, f32 b);
 
 // Reduce Ops
 tensor *tensor_sum(tensor *t, i32 axis, bool keepdims);
@@ -117,9 +129,8 @@ void print_2d_tensor(tensor *t) {
 	printf("\n");
 }
 
-
 // Helper funcs
-static i32 get_size(i32 *shape, i32 ndims) {
+i32 get_size(i32 *shape, i32 ndims) {
 	i32 size = 1;
 	for (i32 i=0; i<ndims; ++i) size *= shape[i];
 	return size;
@@ -150,20 +161,15 @@ i32 tensor_getidx(i32 *strides, i32 ndims, i32 *indices) {
 	return idx;
 }
 
-f32 *tensor_getitem(tensor *t, i32 *strides, i32 *indices) {
-	return t->data + tensor_getidx(strides, t->ndims, indices);
-}
+f32 *tensor_getitem(tensor *t, i32 *strides, i32 *indices) { return t->data + tensor_getidx(strides, t->ndims, indices); }
 
 i32 inc_shapeindex(i32 *indices, i32 *shape, i32 ndims) {
 	indices[ndims-1]++;
 	for (i32 i=ndims-1; i>=0; i--) {
-		if (indices[i] == shape[i]) {
-			indices[i]=0;
-			if (i == 0) return -1;
-			indices[i-1]++;
-		} else {
-			break;
-		}
+		if (indices[i] != shape[i]) break;
+		indices[i]=0;
+		if (i == 0) return -1;
+		indices[i-1]++;
 	}
 	return 1;
 }
@@ -171,14 +177,14 @@ i32 inc_shapeindex(i32 *indices, i32 *shape, i32 ndims) {
 tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 	if (get_size(newshape, ndims) != get_size(t->shape, t->ndims)) return NULL;
 
-	tensor *nt = alloc_tensor(newshape, ndims, 0, RESHAPE);
+	tensor *nt = alloc_tensor(newshape, ndims, 0, RESHAPE, false);
 	nt->parent_l.type = TENSOR; nt->parent_l.value.t = t;
 	memcpy(nt->data, t->data, get_size(t->shape, t->ndims) * sizeof(f32));
 	return nt;
 }
 
 tensor *tensor_apply_unop(tensor *t, f32 (*func)(f32, f32), f32 arg, tensor_op op) {
-	tensor *nt = alloc_tensor(t->shape, t->ndims, 0, op);
+	tensor *nt = alloc_tensor(t->shape, t->ndims, 0, op, false);
 	nt->parent_l.type = TENSOR; nt->parent_l.value.t = t;
 	nt->parent_r.type = NONE; nt->grad_arg = arg;
 
@@ -207,7 +213,7 @@ tensor *_tensor_reluback(tensor *t) { return tensor_apply_unop(t, &_relu_back, -
 tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op op) {
 	if (a->ndims != b->ndims) return NULL;
 	i32 *cshape = broadcast_shape(a->shape, b->shape, a->ndims);
-	tensor *c = alloc_tensor(cshape, a->ndims, 0, op);
+	tensor *c = alloc_tensor(cshape, a->ndims, 0, op, false);
 	free(cshape);
 
 	c->parent_l.type = TENSOR; c->parent_l.value.t = a;
@@ -226,7 +232,7 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 }
 
 tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*func)(f32, f32), tensor_op op) {
-	tensor *c = alloc_tensor(a->shape, a->ndims, 0, op);
+	tensor *c = alloc_tensor(a->shape, a->ndims, 0, op, false);
 
 	i32 *a_bstrides = broadcast_strides(a);
 	i32 *iter = (i32*) malloc(a->ndims * sizeof(i32));
@@ -249,20 +255,16 @@ f32 __add(f32 a, f32 b) { return a + b; }
 f32 __eq(f32 a, f32 b) { return a == b ? 1 : 0; }
 tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__mul, MUL); }
 tensor *tensor_div(tensor *a, tensor *b) {
-	tensor *denom = tensor_pow(b, -1); denom->free_after_grad = true;
+	tensor *denom = tensor_pow(b, -1);
 	return tensor_mul(a, denom);
 }
 tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__add, ADD); }
 tensor *tensor_sub(tensor *a, tensor *b) {
-	tensor *neg = tensor_mul_scalar(b, -1); neg->free_after_grad = true;
+	tensor *neg = tensor_mul_scalar(b, -1);
 	return tensor_add(a, neg);
 }
 tensor *tensor_eq(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__eq, NEW); }
 tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__mul, MUL); }
-tensor *tensor_div_scalar(tensor *a, f32 b) { return tensor_mul_scalar(a, 1.0 / b); }
-tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add, ADD); }
-tensor *tensor_sub_scalar(tensor *a, f32 b) { return tensor_add_scalar(a, b * -1); }
-tensor *tensor_eq_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__eq, NEW); }
 
 tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f32*, f32), f32 init, tensor_op op) {
 	i32 *nshape;
@@ -274,8 +276,8 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 		nshape = (i32*) malloc(t->ndims * sizeof(i32));
 		for (i32 i=0; i<t->ndims; ++i) nshape[i] = i == axis ? 1 : t->shape[i];
 	}
-
-	tensor *r = alloc_tensor(nshape, keepdims ? t->ndims : t->ndims-1, 0, op);
+	free(nshape);
+	tensor *r = alloc_tensor(nshape, keepdims ? t->ndims : t->ndims-1, 0, op, false);
 
 	r->parent_l.type = TENSOR; r->parent_l.value.t = t;
 	r->parent_r.type = NONE;
@@ -307,8 +309,8 @@ void __max(f32 *a, f32 b) { *a = *a > b ? *a : b; }
 tensor *tensor_sum(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__sum, 0, SUM); }
 tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -INFINITY, MAX); }
 tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) {
-	tensor *sum = tensor_sum(t, axis, keepdims); sum->free_after_grad = true;
-	return tensor_div_scalar(sum, (f32)t->shape[axis]); 
+	tensor *sum = tensor_sum(t, axis, keepdims);
+	return tensor_mul_scalar(sum, 1.0 / (f32)t->shape[axis]); 
 }
 
 tensor *tensor_gemm(tensor *a, tensor *b) {
@@ -316,18 +318,18 @@ tensor *tensor_gemm(tensor *a, tensor *b) {
 	i32 ash[3] = { a->shape[0], a->shape[1], 1 };
 	i32 bsh[3] = { 1, b->shape[0], b->shape[1] };
 
-	a = tensor_reshape(a, ash, 3); a->free_after_grad = true;
-	b = tensor_reshape(b, bsh, 3); b->free_after_grad = true;
-	tensor *c = tensor_mul(a, b); c->free_after_grad = true;
+	a = tensor_reshape(a, ash, 3);
+	b = tensor_reshape(b, bsh, 3);
+	tensor *c = tensor_mul(a, b);
 
 	return tensor_sum(c, 1, false);
 }
 
 tensor *tensor_softmax(tensor *t) {
-	tensor *max = tensor_max(t, 1, true); max->free_after_grad = true;
-	t = tensor_sub(t, max); t->free_after_grad = true;
-	t = tensor_exp(t); t->free_after_grad = true;
-	tensor *bottom = tensor_sum(t, 1, true); bottom->free_after_grad = true;
+	tensor *max = tensor_max(t, 1, true);
+	t = tensor_sub(t, max);
+	t = tensor_exp(t);
+	tensor *bottom = tensor_sum(t, 1, true);
 	return tensor_div(t, bottom);
 }
 
@@ -343,13 +345,16 @@ void try_init_parent_grad(tensor_parent *parent) {
 	if (parent->type != TENSOR) return;
 	tensor *t = (tensor*)parent->value.t;
 	if (t->grad != NULL) return;
-	t->grad = alloc_tensor(t->shape, t->ndims, 0, NEW);
+	t->grad = alloc_tensor(t->shape, t->ndims, 0, NEW, t->is_param);
 }
 
+// Broadcasts reduced tensor to match parent shape for backprop
+// From = data to copy over
+// Node = necessary for conversion metadata only
 tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
-	tensor *g = alloc_tensor(node->shape, node->ndims, 0, NEW);
+	tensor *g = alloc_tensor(node->shape, node->ndims, 0, NEW, false);
+	tensor *pg = (tensor*)parent->grad;
 	copy_data(g, from);
-	tensor *pg = alloc_tensor(parent->shape, parent->ndims, 0, NEW);
 	i32 axis = node->grad_arg;
 
 	if (! node->grad_keptdims) {
@@ -370,7 +375,6 @@ tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 	} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
 	free(indices);
 	free(bstrides);
-	free(g);
 	return pg;
 }
 
@@ -386,7 +390,7 @@ tensor *tensor_backward(tensor *t) {
 	i32 n =0, ns = 0;
 	topo_dfs(t, topo, seen, &n, &ns);
 
-	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW);
+	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW, t->is_param);
 	for (i32 i=n-1; i>0; i--) {
 		tensor *node = topo[i];
 
@@ -394,7 +398,7 @@ tensor *tensor_backward(tensor *t) {
 		try_init_parent_grad(&node->parent_l);
 
 		tensor *g = (tensor*)node->grad;
-		f32 pow; tensor *lp; tensor *lg;
+		f32 pow; tensor *lp, *lg, *unred;
 		tensor *contrib; tensor *mask; tensor *max_broadcast;
 
 		if (node->parent_op != NEW) {
@@ -409,44 +413,34 @@ tensor *tensor_backward(tensor *t) {
 			case EXP: lp->grad = tensor_mul(g, node); break;
 			case LOG: lp->grad = tensor_mul(g, tensor_pow(lp, -1)); break;
 			case ADD:
+				lp->grad = _unbroadcast_grad(g, lp);
 				if (node->parent_r.type == TENSOR) {
 					tensor *rp = (tensor*)node->parent_r.value.t;
-					tensor *rg = (tensor*)rp->grad;
-					tensor *g_r = _unbroadcast_grad(g, rp);
-					tensor *g_l = _unbroadcast_grad(g, lp);
-					copy_data(rg, g_r);
-					copy_data(lg, g_l);
-				} else {
-					tensor *g_l = _unbroadcast_grad(g, lp);
-					copy_data(lg, g_l);
+					rp->grad = _unbroadcast_grad(g, rp);
 				}
 				break;	
 			case MUL:
 				if (node->parent_r.type == TENSOR) {
 					tensor *rp = (tensor*)node->parent_r.value.t;
-					tensor *gl = tensor_mul(g, rp);
-					tensor *gr = tensor_mul(g, lp);
-					lp->grad = _unbroadcast_grad(gl, lp);
-					rp->grad = _unbroadcast_grad(gr, rp);
+					lp->grad = _unbroadcast_grad(tensor_mul(g, rp), lp);
+					rp->grad = _unbroadcast_grad(tensor_mul(g, lp), rp);
 				} else {
 					lp->grad = _unbroadcast_grad(tensor_mul_scalar(g, node->parent_r.value.s), lp);
 				}
 				break;
 			case SUM: lp->grad = _unreduce_tensor(g, node, lp); break;
 			case MAX:
-				lp->grad = _unreduce_tensor(g, node, lp);
+				_unreduce_tensor(g, node, lp);
+				unred = duplicate_tensor(lg);
 				mask = tensor_eq(_unreduce_tensor(node, node, lp), lp);
-				lp->grad = tensor_mul((tensor*)lp->grad, mask);
+				lp->grad = tensor_mul(unred, mask);
 				break;
 			case RELU: lp->grad = tensor_mul(g, _tensor_reluback(lp)); break;
 			default: continue; break;
 		}
 		if (node->parent_op != NEW) lp->grad = tensor_add((tensor*)lp->grad, contrib);
 	}
-
-	for (int i=0; i<n; ++i)
-		if (topo[i]->free_after_grad)
-			free_tensor(topo[i]);
+	arena_clear();
 }
 
 tensor *duplicate_tensor(tensor *t) {
@@ -470,28 +464,31 @@ void free_tensor(tensor *t) {
 	free(t);
 }
 
-tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op) {
+tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
 	i32 size = get_size(shape, ndims);
 
-	tensor *t = (tensor*) malloc(sizeof(tensor));
-	i32 *nshape = (i32*) malloc(ndims * sizeof(i32));
-	i32 *strides = (i32*) malloc(ndims * sizeof(i32));
-	f32 *data = (f32*) malloc(size * sizeof(f32));
+	tensor *t; i32 *nshape, *strides; f32 *data;
+	if (! is_param) {
+		t = (tensor*) arena_alloc(sizeof(tensor));
+		nshape = (i32*) arena_alloc(ndims * sizeof(i32));
+		strides = (i32*) arena_alloc(ndims * sizeof(i32));
+		data = (f32*) arena_alloc(size * sizeof(f32));
+	} else {
+		t = (tensor*) malloc(sizeof(tensor));
+		nshape = (i32*) malloc(ndims * sizeof(i32));
+		strides = (i32*) malloc(ndims * sizeof(i32));
+		data = (f32*) malloc(size * sizeof(f32));
+	}
 
 	calculate_strides(shape, ndims, &strides);
-
 	for (int i=0; i<size; ++i) data[i]=init;
 	memcpy(nshape, shape, ndims * sizeof(i32));
 
 	t->parent_op = op;
 	t->parent_l.type = NONE; t->parent_r.type = NONE;
-	t->free_after_grad = false;
-	t->data = data;
-	t->grad = NULL;
-	t->ndims = ndims;
-	t->shape = nshape;
-	t->strides = strides;
-
+	t->ndims = ndims; t->is_param = is_param;
+	t->data = data; t->grad = NULL;
+	t->shape = nshape; t->strides = strides;
 	return t;
 }
 
@@ -504,13 +501,13 @@ layer_linear *init_linear(i32 inputs, i32 outputs) {
 	layer_linear *layer = (layer_linear*)malloc(sizeof(layer_linear));
 	layer->inputs = inputs; layer->outputs = outputs;
 	// TODO: heuristic weight init values
-	i32 wshape[2] = { outputs, inputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW);
-	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW);
+	i32 wshape[2] = { outputs, inputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW, true);
+	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
 	return layer;
 }
 
 tensor *linear_forward(layer_linear *layer, tensor *x) {
-	tensor *y = tensor_gemm(x, layer->weights); y->free_after_grad=true;
+	tensor *y = tensor_gemm(x, layer->weights);
 	return tensor_add(y, layer->bias);
 }
 
@@ -523,7 +520,7 @@ tensor *tensor_pad(tensor *t, i32 ph, i32 pw) {
 	nshape[3]=t->shape[3];
 
 	// TODO: Copy autograd info??
-	tensor *pt = alloc_tensor(nshape, t->ndims, 0, NEW);
+	tensor *pt = alloc_tensor(nshape, t->ndims, 0, NEW, false);
 	int indices[4] = { 0, 0, 0, 0 }; int pindices[4];
 	do {
 		memcpy(pindices, indices, 4 * sizeof(i32));
@@ -540,7 +537,7 @@ tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw
 	i32 oh = floor((h - kh + ph*2) / sh) + 1, ow = floor((w - kw + pw*2) / sw) + 1;
 	im = tensor_pad(im, ph, pw);
 	i32 cshape[2] = { N * oh * ow, c * kh * kw};
-	tensor *cols = alloc_tensor(cshape, 2,0, NEW);
+	tensor *cols = alloc_tensor(cshape, 2,0, NEW, false);
 
 	// TODO: parallelize?
 	i32 row=0;
@@ -576,16 +573,16 @@ layer_conv2d *init_conv2d(i32 channels_in, i32 channels_out, i32 kstrides, i32 k
 	layer_conv2d *layer = (layer_conv2d*)malloc(sizeof(layer_conv2d));
 	layer->kstrides=kstrides; layer->ksize=ksize; layer->padding=padding;
 	layer->channels_in=channels_in; layer->channels_out=channels_out;
-	i32 wshape[4] = { ksize, ksize, channels_in, channels_out }; layer->weights = alloc_tensor(wshape, 4, 0, NEW);
-	i32 bshape[1] = { 1 }; layer->bias = alloc_tensor(bshape, 1, 0, NEW);
+	i32 wshape[4] = { ksize, ksize, channels_in, channels_out }; layer->weights = alloc_tensor(wshape, 4, 0, NEW, true);
+	i32 bshape[1] = { 1 }; layer->bias = alloc_tensor(bshape, 1, 0, NEW, true);
 	return layer;
 }
 
 tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
 	tensor *cols = tensor_im2col(x, layer->ksize, layer->ksize, layer->kstrides, layer->kstrides, layer->padding, layer->padding);
 	i32 kshape[2] = { layer->ksize * layer->ksize * x->shape[3], layer->channels_out };
-	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); kernel->free_after_grad=true;
-	tensor *y = tensor_gemm(cols, kernel); y->free_after_grad=true;
+	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); 
+	tensor *y = tensor_gemm(cols, kernel);
 	return tensor_add(y, layer->bias);
 }
 
@@ -606,4 +603,8 @@ optim_ADAM *init_ADAM(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b
 }
 
 void step_ADAM(optim_ADAM *adam) {
+	/*
+	for (int i=0; i<adam->nparams; +i) {
+		adam->m[i] = adam->b1 * adam->m[i] + (1 - adam->b1) * 
+	}*/
 }
