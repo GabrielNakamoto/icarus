@@ -80,8 +80,6 @@ typedef struct {
 
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param);
-void free_tensor(tensor *t);
-tensor *duplicate_tensor(tensor *t);
 f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
 
 // Reshape Ops
@@ -360,12 +358,11 @@ tensor *tensor_backward(tensor *t) {
 	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW, t->is_param);
 	for (i32 i=n-1; i>0; i--) {
 		tensor *node = topo[i];
+		tensor *g = (tensor*)node->grad;
 
 		try_init_parent_grad(&node->parent_r);
 		try_init_parent_grad(&node->parent_l);
 
-		tensor *g = (tensor*)node->grad;
-		f32 pow;
 		tensor *lp, *rp, *lg, *rg, *dl, *dr;
 
 		if (node->parent_l.type == TENSOR) {
@@ -400,34 +397,11 @@ tensor *tensor_backward(tensor *t) {
 			case RELU: dl = tensor_mul(g, _tensor_reluback(lp)); break;
 			default: continue; break;
 		}
-
 		if (node->parent_l.type == TENSOR) copy_data(lg, tensor_add(lg, dl));
 		if (node->parent_r.type == TENSOR) copy_data(rg, tensor_add(rg, dr));
 	}
 	arena_clear();
 	return topo[n];
-}
-
-// TODO: use arena? do I need this function, usage kinda hacky
-tensor *duplicate_tensor(tensor *t) {
-	tensor *nt = (tensor*) malloc(sizeof(tensor));
-	memcpy(nt, t, sizeof(tensor));
-
-	nt->data = (f32*)malloc(get_size(t->shape, t->ndims) * sizeof(f32));
-	nt->shape = (i32*)malloc(t->ndims * sizeof(i32));
-	nt->strides = (i32*)malloc(t->ndims * sizeof(i32));
-	copy_data(nt, t);
-	memcpy(nt->shape, t->shape, t->ndims * sizeof(i32));
-	memcpy(nt->strides, t->strides, t->ndims * sizeof(i32));
-	return nt;
-}
-
-void free_tensor(tensor *t) {
-	free(t->data);
-	free(t->strides);
-	free(t->shape);
-	free(t->grad);
-	free(t);
 }
 
 void init_tensor(tensor *t, i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
@@ -561,11 +535,11 @@ tensor *batchnorm_forward(layer_batchnorm *layer, tensor *x) {
 
 typedef struct {
 	tensor **m, **v, **params;
-	i32 step_size, nparams, step;
-	f32 b1, b2;
+	i32 nparams, step;
+	f32 step_size, b1, b2;
 } optim_ADAM;
 
-optim_ADAM *ADAM_init(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b2) {
+optim_ADAM *ADAM_init(tensor **params, i32 nparams, f32 step_size, f32 b1, f32 b2) {
 	optim_ADAM *adam = (optim_ADAM*)malloc(sizeof(optim_ADAM));
 	tensor **m = (tensor**)calloc(nparams, sizeof(tensor)), **v = (tensor**)calloc(nparams, sizeof(tensor));
 	for (i32 i=0; i<nparams; ++i) {

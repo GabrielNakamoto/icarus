@@ -25,8 +25,20 @@ void model_init() {
 	net.l6 = batchnorm_init(64);
 
 	net.l7 = linear_init(576, 10);
+
+	tensor *params[14] = {
+		net.l1->weights, net.l1->bias,
+		net.l2->weights, net.l2->bias,
+		net.l3->weights, net.l3->bias,
+		net.l4->weights, net.l4->bias,
+		net.l5->weights, net.l5->bias,
+		net.l6->weights, net.l6->bias,
+		net.l7->weights, net.l7->bias,
+	};
+	net.optim = ADAM_init(params, 14, 0.001, 0.99, 0.099);
 }
 void model_forward(tensor *x) {
+	// x(N, H, W, C)
 	x = conv2d_forward(net.l1, x);
 	x = conv2d_forward(net.l2, x);
 	x = batchnorm_forward(net.l3, x);
@@ -42,4 +54,5 @@ void model_forward(tensor *x) {
 }
 
 int main(int argc, char **argv) {
+	model_init();
 }
