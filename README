@@ -1,16 +1,16 @@
 # Icarus
 
-This is me flying to close to the sun.
+This is me flying too close to the sun.
 
 Goal: > 95% MNIST test accuracy raw c
 
 To implement:
 - [ ] memory management 
-	- [ ] arena allocator for intermediate op
+	- [x] arena allocator for intermediate op
 - [x] basic ops
 - [x] reshape ops
 - [x] reduce ops
 - [ ] nn ops 
-- [ ] back prop
+- [x] back prop
 - [x] layers (Conv2d, BatchNorm, Linear)
-- [ ] ADAM
+- [x] ADAM
