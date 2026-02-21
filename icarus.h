@@ -20,7 +20,7 @@ static size_t arena_offset = 0;
 void arena_clear() { arena_offset = 0; }
 void *arena_alloc(u64 size) {
 	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
-	printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
+	// printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
 	if (arena_offset + padding + size > ARENA_SIZE) return NULL;
 	void *ptr = arena_mem + arena_offset + padding;
 	arena_offset += padding + size;
@@ -28,8 +28,7 @@ void *arena_alloc(u64 size) {
 }
 
 typedef enum {
-	NEW,
-	RESHAPE,
+	NEW, RESHAPE,
 	POW, EXP, LOG,
 	MUL, ADD,
 	SUM, MAX,
@@ -254,17 +253,12 @@ f32 __mul(f32 a, f32 b) { return a * b; }
 f32 __add(f32 a, f32 b) { return a + b; }
 f32 __eq(f32 a, f32 b) { return a == b ? 1 : 0; }
 tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__mul, MUL); }
-tensor *tensor_div(tensor *a, tensor *b) {
-	tensor *denom = tensor_pow(b, -1);
-	return tensor_mul(a, denom);
-}
+tensor *tensor_div(tensor *a, tensor *b) { return tensor_mul(a, tensor_pow(b, -1)); }
 tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__add, ADD); }
-tensor *tensor_sub(tensor *a, tensor *b) {
-	tensor *neg = tensor_mul_scalar(b, -1);
-	return tensor_add(a, neg);
-}
+tensor *tensor_sub(tensor *a, tensor *b) { return tensor_add(a, tensor_mul_scalar(b, -1)); }
 tensor *tensor_eq(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__eq, NEW); }
 tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__mul, MUL); }
+tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add, ADD); }
 
 tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f32*, f32), f32 init, tensor_op op) {
 	i32 *nshape;
@@ -276,8 +270,8 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 		nshape = (i32*) malloc(t->ndims * sizeof(i32));
 		for (i32 i=0; i<t->ndims; ++i) nshape[i] = i == axis ? 1 : t->shape[i];
 	}
-	free(nshape);
 	tensor *r = alloc_tensor(nshape, keepdims ? t->ndims : t->ndims-1, 0, op, false);
+	free(nshape);
 
 	r->parent_l.type = TENSOR; r->parent_l.value.t = t;
 	r->parent_r.type = NONE;
@@ -308,10 +302,7 @@ void __sum(f32 *a, f32 b) { *a += b; }
 void __max(f32 *a, f32 b) { *a = *a > b ? *a : b; }
 tensor *tensor_sum(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__sum, 0, SUM); }
 tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -INFINITY, MAX); }
-tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) {
-	tensor *sum = tensor_sum(t, axis, keepdims);
-	return tensor_mul_scalar(sum, 1.0 / (f32)t->shape[axis]); 
-}
+tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) { return tensor_mul_scalar(tensor_sum(t, axis, keepdims), 1.0 / (f32)t->shape[axis]); }
 
 tensor *tensor_gemm(tensor *a, tensor *b) {
 	if (a->shape[1] != b->shape[0]) return NULL;
@@ -430,6 +421,7 @@ tensor *tensor_backward(tensor *t) {
 				break;
 			case SUM: lp->grad = _unreduce_tensor(g, node, lp); break;
 			case MAX:
+				// TODO: is this memory safe / efficient??
 				_unreduce_tensor(g, node, lp);
 				unred = duplicate_tensor(lg);
 				mask = tensor_eq(_unreduce_tensor(node, node, lp), lp);
@@ -464,17 +456,15 @@ void free_tensor(tensor *t) {
 	free(t);
 }
 
-tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
+void init_tensor(tensor *t, i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
 	i32 size = get_size(shape, ndims);
 
-	tensor *t; i32 *nshape, *strides; f32 *data;
+	i32 *nshape, *strides; f32 *data;
 	if (! is_param) {
-		t = (tensor*) arena_alloc(sizeof(tensor));
 		nshape = (i32*) arena_alloc(ndims * sizeof(i32));
 		strides = (i32*) arena_alloc(ndims * sizeof(i32));
 		data = (f32*) arena_alloc(size * sizeof(f32));
 	} else {
-		t = (tensor*) malloc(sizeof(tensor));
 		nshape = (i32*) malloc(ndims * sizeof(i32));
 		strides = (i32*) malloc(ndims * sizeof(i32));
 		data = (f32*) malloc(size * sizeof(f32));
@@ -489,8 +479,14 @@ tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_para
 	t->ndims = ndims; t->is_param = is_param;
 	t->data = data; t->grad = NULL;
 	t->shape = nshape; t->strides = strides;
+}
+
+tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
+	tensor *t = is_param ? (tensor*)malloc(sizeof(tensor)) : (tensor*)arena_alloc(sizeof(tensor));
+	init_tensor(t, shape, ndims, init, op, is_param);
 	return t;
 }
+
 
 typedef struct {
 	tensor *weights, *bias;
@@ -564,8 +560,7 @@ tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw
 }
 
 typedef struct {
-	tensor *weights; // 4d tensor (size, size, in channels, out channels)
-	tensor *bias;
+	tensor *weights, *bias;
 	i32 kstrides, ksize, padding, channels_in, channels_out;
 } layer_conv2d;
 
@@ -587,24 +582,32 @@ tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
 }
 
 typedef struct {
-	int *m, *v;
-	i32 step_size, nparams;
+	tensor **m, **v, **params;
+	i32 step_size, nparams, step;
 	f32 b1, b2;
-	tensor **params;
 } optim_ADAM;
 
 optim_ADAM *init_ADAM(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b2) {
 	optim_ADAM *adam = (optim_ADAM*)malloc(sizeof(optim_ADAM));
-	adam->m = (i32*)malloc(nparams * sizeof(i32));
-	adam->v = (i32*)malloc(nparams * sizeof(i32));
+	tensor **m = (tensor**)calloc(nparams, sizeof(tensor)), **v = (tensor**)calloc(nparams, sizeof(tensor));
+	for (i32 i=0; i<nparams; ++i) {
+		init_tensor(m[i], params[i]->shape, params[i]->ndims, 0, NEW, true);
+		init_tensor(v[i], params[i]->shape, params[i]->ndims, 0, NEW, true);
+	}
 	adam->params = params; adam->nparams = nparams;
 	adam->step_size = step_size; adam->b1 = b1; adam->b2 = b2;
+	adam->step = 0;
 	return adam;
 }
 
 void step_ADAM(optim_ADAM *adam) {
-	/*
+	adam->step++;
 	for (int i=0; i<adam->nparams; +i) {
-		adam->m[i] = adam->b1 * adam->m[i] + (1 - adam->b1) * 
-	}*/
+		tensor *g = (tensor*)adam->params[i]->grad;
+		adam->m[i]=tensor_add(tensor_mul_scalar(adam->m[i], adam->b1), tensor_mul_scalar(g, 1 - adam->b1));
+		adam->v[i]=tensor_add(tensor_mul_scalar(adam->v[i], adam->b2), tensor_mul_scalar(g, 1 - adam->b2));
+		tensor *m_hat = tensor_mul_scalar(adam->m[i], 1.0 / (1.0 - powf(adam->b1, adam->step)));
+		tensor *v_hat = tensor_mul_scalar(adam->v[i], 1.0 / (1.0 - powf(adam->b2, adam->step)));
+		adam->params[i] = tensor_sub(adam->params[i], tensor_mul_scalar(tensor_div(m_hat, tensor_add_scalar(tensor_sqrt(v_hat), 1e-6)), adam->step_size));
+	}
 }
