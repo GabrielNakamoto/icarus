@@ -26,7 +26,20 @@ void model_init() {
 
 	net.l7 = linear_init(576, 10);
 }
-void model_forward(tensor *x) {}
+void model_forward(tensor *x) {
+	x = conv2d_forward(net.l1, x);
+	x = conv2d_forward(net.l2, x);
+	x = batchnorm_forward(net.l3, x);
+
+	x = conv2d_forward(net.l4, x);
+	x = conv2d_forward(net.l5, x);
+	x = batchnorm_forward(net.l6, x);
+
+	i32 flattened[2] = { x->shape[0], 576 };
+	x = tensor_reshape(x, flattened, 2);
+
+	x = linear_forward(net.l7, x);
+}
 
 int main(int argc, char **argv) {
 }

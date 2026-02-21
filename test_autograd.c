@@ -107,9 +107,13 @@ static tensor *fn_sum_axis1(tensor *t) { return tensor_sum(t, 1, false); }
 static tensor *fn_sum_axis0_kd(tensor *t) { return tensor_sum(t, 0, true); }
 static tensor *fn_max_axis1(tensor *t) { return tensor_max(t, 1, false); }
 static tensor *fn_mean_axis1(tensor *t) { return tensor_mean(t, 1, false); }
-static tensor *fn_softmax(tensor *t) { return tensor_softmax(t); }
+static tensor *fn_softmax(tensor *t) {
+	tensor *ls = tensor_logsoftmax(t);
+	return tensor_exp(ls);
+}
 static tensor *fn_chain_exp_pow(tensor *t) { return tensor_exp(tensor_pow(t, 2.0f)); }
 // static tensor *fn_softplus(tensor *t) { return tensor_log(tensor_add_scalar(tensor_exp(t), 1.0f)); }
+static tensor *fn_logsoftmax(tensor *t) { return tensor_logsoftmax(t); }
 static tensor *fn_chain_sum_relu(tensor *t) {
 	tensor *r = tensor_relu(t);
 	r = tensor_sum(r, 1, false);
@@ -386,6 +390,28 @@ void test_softplus() {
 	check_grad(t, expected, 4, "softplus");
 }*/
 
+void test_logsoftmax() {
+	printf("test_logsoftmax:\n");
+	i32 sh[] = {2, 3};
+	f32 d[] = {1.0, 2.0, 3.0, 1.0, 1.0, 1.0};
+	tensor *t = make_tensor(sh, 2, d);
+
+	tensor *out = fn_logsoftmax(t);
+
+	// logsoftmax values should be negative, and exp(logsoftmax) should sum to 1
+	f32 row0 = expf(out->data[0]) + expf(out->data[1]) + expf(out->data[2]);
+	f32 row1 = expf(out->data[3]) + expf(out->data[4]) + expf(out->data[5]);
+	if (check_close(row0, 1.0f, GRAD_EPS) && check_close(row1, 1.0f, GRAD_EPS)) {
+		printf("  PASS logsoftmax_forward\n"); tests_passed++;
+	} else {
+		printf("  FAIL logsoftmax_forward: exp row sums %.4f, %.4f\n", row0, row1);
+		tests_failed++;
+	}
+
+	tensor_backward(out);
+	check_numerical(d, sh, 2, fn_logsoftmax, t, "logsoftmax_grad");
+}
+
 void test_chain_sum_relu() {
 	printf("test_chain_sum_relu:\n");
 	i32 sh[] = {2, 3};
@@ -424,6 +450,7 @@ int main() {
 	test_chain_exp_pow();
 	// test_softplus();
 	test_chain_sum_relu();
+	test_logsoftmax();
 
 	printf("\n=== Results: %d passed, %d failed ===\n", tests_passed, tests_failed);
 	return tests_failed > 0 ? 1 : 0;
