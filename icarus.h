@@ -8,7 +8,7 @@
 #include <sys/types.h>
 
 #define MAX_TOPO_NODES 1024
-#define ARENA_SIZE 16*1024*1024
+#define ARENA_SIZE 256*1024*1024 // 256mb
 #define ARENA_ALIGN 64
 
 typedef float f32;
@@ -435,11 +435,23 @@ typedef struct {
 	i32 inputs, outputs;
 } layer_linear;
 
+f32 box_mueller_rand() {
+	float u1 = ((float)rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
+	float u2 = ((float)rand() + 1.0f) / ((float)RAND_MAX + 1.0f);
+	return sqrtf(-2.0f * logf(u1)) * cosf(2.0f * 3.14159265f * u2);
+}
+
+void init_he(tensor *weights, i32 n) {
+	f32 std = sqrt(2.0 / n);
+	for (int i=0; i<n; ++i) weights->data[i]=box_mueller_rand() * std;
+}
+
+
 layer_linear *linear_init(i32 inputs, i32 outputs) {
 	layer_linear *layer = (layer_linear*)malloc(sizeof(layer_linear));
 	layer->inputs = inputs; layer->outputs = outputs;
-	// TODO: heuristic weight init values
 	i32 wshape[2] = { outputs, inputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW, true);
+	init_he(layer->weights, outputs * inputs);
 	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
 	return layer;
 }
@@ -517,7 +529,7 @@ typedef struct {
 
 layer_batchnorm *batchnorm_init(i32 channels) {
 	layer_batchnorm *layer = (layer_batchnorm*)malloc(sizeof(layer_batchnorm));
-	i32 pshape[2] = { channels, 1 };
+	i32 pshape[2] = { 1, channels };
 	layer->channels = channels;
 	layer->weights = alloc_tensor(pshape, 2, 1, NEW, true);
 	layer->bias = alloc_tensor(pshape, 2, 1, NEW, true);
@@ -525,12 +537,22 @@ layer_batchnorm *batchnorm_init(i32 channels) {
 }
 
 tensor *batchnorm_forward(layer_batchnorm *layer, tensor *x) {
-	tensor *mean = x; tensor *var;
-	for (i32 i=0; i<x->ndims-1; ++i) mean = tensor_mean(mean, i, true);
-	var = tensor_pow(tensor_sub(x, mean), 2.0);
-	for (i32 i=0; i<x->ndims-1; ++i) var = tensor_mean(var, i, true);
+	i32 *orig_shape = x->shape; i32 orig_ndims = x->ndims;
+	i32 flat[2] = { get_size(x->shape, x->ndims-1), x->shape[3] };
+	x = tensor_reshape(x, flat, 2);
+
+	tensor *mean = tensor_mean(x, 0, true);
+	tensor *var = tensor_mean(tensor_pow(tensor_sub(x, mean), 2.0), 0, true);
 	x = tensor_div(tensor_sub(x, mean), tensor_sqrt(tensor_add_scalar(var, 1e-6)));
-	return tensor_add(tensor_mul(x, layer->weights), layer->bias);
+	x = tensor_add(tensor_mul(x, layer->weights), layer->bias);
+
+	return tensor_reshape(x, orig_shape, orig_ndims);
+}
+
+void zero_grads(tensor **params, i32 nparams) {
+	for (i32 i=0; i<nparams; ++i)
+		if (params[i]->grad != NULL)
+			memset(((tensor*)params[i]->grad)->data, 0.0f, get_size(params[i]->shape, params[i]->ndims) * sizeof(f32));
 }
 
 typedef struct {

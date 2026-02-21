@@ -4,13 +4,10 @@ This is me flying too close to the sun.
 
 Goal: > 95% MNIST test accuracy raw c
 
-To implement:
-- [ ] memory management 
-	- [x] arena allocator for intermediate op
-- [x] basic ops
-- [x] reshape ops
-- [x] reduce ops
-- [ ] nn ops 
-- [x] back prop
-- [x] layers (Conv2d, BatchNorm, Linear)
-- [x] ADAM
+To do:
+- [ ] im2col backwards
+- [ ] max pool 2d layer
+- [ ] 1 hot encode labels
+- [ ] batching
+- [ ] dropout?
+- [ ] cleanup
