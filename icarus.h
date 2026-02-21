@@ -49,7 +49,6 @@ typedef struct {
 	bool grad_keptdims;
 	void *grad; // tensor
 	bool free_after_grad;
-	i32 ref_count;
 
 	// Metadata
 	i32 ndims;
@@ -60,6 +59,7 @@ typedef struct {
 
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op);
+void free_tensor(tensor *t);
 tensor *duplicate_tensor(tensor *t);
 f32 *tensor_getitem(tensor *t, i32 *strides, i32 *shape);
 
@@ -248,14 +248,12 @@ f32 __add(f32 a, f32 b) { return a + b; }
 f32 __eq(f32 a, f32 b) { return a == b ? 1 : 0; }
 tensor *tensor_mul(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__mul, MUL); }
 tensor *tensor_div(tensor *a, tensor *b) {
-	tensor *denom = tensor_pow(b, -1);
-	denom->free_after_grad = true;
+	tensor *denom = tensor_pow(b, -1); denom->free_after_grad = true;
 	return tensor_mul(a, denom);
 }
 tensor *tensor_add(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__add, ADD); }
 tensor *tensor_sub(tensor *a, tensor *b) {
-	tensor *neg = tensor_mul_scalar(b, -1);
-	neg->free_after_grad = true;
+	tensor *neg = tensor_mul_scalar(b, -1); neg->free_after_grad = true;
 	return tensor_add(a, neg);
 }
 tensor *tensor_eq(tensor *a, tensor *b) { return tensor_apply_biop(a, b, &__eq, NEW); }
@@ -307,26 +305,28 @@ void __sum(f32 *a, f32 b) { *a += b; }
 void __max(f32 *a, f32 b) { *a = *a > b ? *a : b; }
 tensor *tensor_sum(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__sum, 0, SUM); }
 tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -INFINITY, MAX); }
-tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) { return tensor_div_scalar(tensor_sum(t, axis, keepdims), t->shape[axis]); }
+tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) {
+	tensor *sum = tensor_sum(t, axis, keepdims); sum->free_after_grad = true;
+	return tensor_div_scalar(sum, (f32)t->shape[axis]); 
+}
 
 tensor *tensor_gemm(tensor *a, tensor *b) {
 	if (a->shape[1] != b->shape[0]) return NULL;
-
 	i32 ash[3] = { a->shape[0], a->shape[1], 1 };
 	i32 bsh[3] = { 1, b->shape[0], b->shape[1] };
 
-	a = tensor_reshape(a, ash, 3);
-	b = tensor_reshape(b, bsh, 3);
+	a = tensor_reshape(a, ash, 3); a->free_after_grad = true;
+	b = tensor_reshape(b, bsh, 3); b->free_after_grad = true;
+	tensor *c = tensor_mul(a, b); c->free_after_grad = true;
 
-	tensor *c = tensor_mul(a, b);
 	return tensor_sum(c, 1, false);
 }
 
 tensor *tensor_softmax(tensor *t) {
-	tensor *max = tensor_max(t, 1, true);
-	t = tensor_sub(t, max);
-	t = tensor_exp(t);
-	tensor *bottom = tensor_sum(t, 1, true);
+	tensor *max = tensor_max(t, 1, true); max->free_after_grad = true;
+	t = tensor_sub(t, max); t->free_after_grad = true;
+	t = tensor_exp(t); t->free_after_grad = true;
+	tensor *bottom = tensor_sum(t, 1, true); bottom->free_after_grad = true;
 	return tensor_div(t, bottom);
 }
 
@@ -343,16 +343,6 @@ void try_init_parent_grad(tensor_parent *parent) {
 	tensor *t = (tensor*)parent->value.t;
 	if (t->grad != NULL) return;
 	t->grad = alloc_tensor(t->shape, t->ndims, 0, NEW);
-}
-
-void try_free_parent(tensor_parent *p) {
-	if (p->type != TENSOR) return;
-	tensor *t = (tensor*)p->value.t;
-	t->ref_count--;
-	if (t->ref_count == 0 && t->free_after_grad) {
-		printf("Freeing intermediate tensor...\n");
-		free(t);
-	}
 }
 
 tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
@@ -394,12 +384,6 @@ tensor *tensor_backward(tensor *t) {
 	tensor *topo[MAX_TOPO_NODES], *seen[MAX_TOPO_NODES];
 	i32 n =0, ns = 0;
 	topo_dfs(t, topo, seen, &n, &ns);
-
-	for (i32 i=0; i<n; ++i) topo[i]->ref_count=0;
-	for (i32 i=0; i<n; ++i) {
-		if (topo[i]->parent_l.type == TENSOR) ((tensor*)topo[i]->parent_l.value.t)->ref_count++;
-		if (topo[i]->parent_r.type == TENSOR) ((tensor*)topo[i]->parent_r.value.t)->ref_count++;
-	}
 
 	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW);
 	for (i32 i=n-1; i>0; i--) {
@@ -457,9 +441,11 @@ tensor *tensor_backward(tensor *t) {
 			default: continue; break;
 		}
 		if (node->parent_op != NEW) lp->grad = tensor_add((tensor*)lp->grad, contrib);
-		try_free_parent(&node->parent_l);
-		try_free_parent(&node->parent_r);
 	}
+
+	for (int i=0; i<n; ++i)
+		if (topo[i]->free_after_grad)
+			free_tensor(topo[i]);
 }
 
 tensor *duplicate_tensor(tensor *t) {
@@ -476,6 +462,11 @@ tensor *duplicate_tensor(tensor *t) {
 }
 
 void free_tensor(tensor *t) {
+	free(t->data);
+	free(t->strides);
+	free(t->shape);
+	free(t->grad);
+	free(t);
 }
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op) {
