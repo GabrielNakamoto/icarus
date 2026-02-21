@@ -1,3 +1,4 @@
+#include <atomic>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -495,20 +496,23 @@ tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op) {
 }
 
 typedef struct {
-	tensor *weights;
-	tensor *bias;
+	tensor *weights, *bias;
+	i32 inputs, outputs;
 } layer_linear;
 
-tensor *linear_forward(layer_linear *layer, tensor *x) {
-	tensor *y = tensor_gemm(x, layer->weights);
-	return tensor_add(y, layer->bias);
+layer_linear *init_linear(i32 inputs, i32 outputs) {
+	layer_linear *layer = (layer_linear*)malloc(sizeof(layer_linear));
+	layer->inputs = inputs; layer->outputs = outputs;
+	// TODO: heuristic weight init values
+	i32 wshape[2] = { outputs, inputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW);
+	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW);
+	return layer;
 }
 
-typedef struct {
-	tensor *kernel;
-	tensor *bias;
-} layer_conv2d;
-
+tensor *linear_forward(layer_linear *layer, tensor *x) {
+	tensor *y = tensor_gemm(x, layer->weights); y->free_after_grad=true;
+	return tensor_add(y, layer->bias);
+}
 
 tensor *tensor_pad(tensor *t, i32 ph, i32 pw) {
 	i32 *nshape = (i32*)malloc(t->ndims * sizeof(i32));
@@ -562,7 +566,27 @@ tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw
 	return cols;
 }
 
-tensor *conv2d_forward(tensor *x) {
+typedef struct {
+	tensor *weights; // 4d tensor (size, size, in channels, out channels)
+	tensor *bias;
+	i32 kstrides, ksize, padding, channels_in, channels_out;
+} layer_conv2d;
+
+layer_conv2d *init_conv2d(i32 channels_in, i32 channels_out, i32 kstrides, i32 ksize, i32 padding) {
+	layer_conv2d *layer = (layer_conv2d*)malloc(sizeof(layer_conv2d));
+	layer->kstrides=kstrides; layer->ksize=ksize; layer->padding=padding;
+	layer->channels_in=channels_in; layer->channels_out=channels_out;
+	i32 wshape[4] = { ksize, ksize, channels_in, channels_out }; layer->weights = alloc_tensor(wshape, 4, 0, NEW);
+	i32 bshape[1] = { 1 }; layer->bias = alloc_tensor(bshape, 1, 0, NEW);
+	return layer;
+}
+
+tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
+	tensor *cols = tensor_im2col(x, layer->ksize, layer->ksize, layer->kstrides, layer->kstrides, layer->padding, layer->padding);
+	i32 kshape[2] = { layer->ksize * layer->ksize * x->shape[3], layer->channels_out };
+	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); kernel->free_after_grad=true;
+	tensor *y = tensor_gemm(cols, kernel); y->free_after_grad=true;
+	return tensor_add(y, layer->bias);
 }
 
 typedef struct {
@@ -571,3 +595,15 @@ typedef struct {
 	f32 b1, b2;
 	tensor **params;
 } optim_ADAM;
+
+optim_ADAM *init_ADAM(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b2) {
+	optim_ADAM *adam = (optim_ADAM*)malloc(sizeof(optim_ADAM));
+	adam->m = (i32*)malloc(nparams * sizeof(i32));
+	adam->v = (i32*)malloc(nparams * sizeof(i32));
+	adam->params = params; adam->nparams = nparams;
+	adam->step_size = step_size; adam->b1 = b1; adam->b2 = b2;
+	return adam;
+}
+
+void step_ADAM(optim_ADAM *adam) {
+}
