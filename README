@@ -5,9 +5,9 @@ This is me flying too close to the sun.
 Goal: > 95% MNIST test accuracy raw c
 
 To do:
-- [ ] im2col backwards
-- [ ] max pool 2d layer
+- [x] im2col backwards
+- [x] max pool 2d layer
+- [x] batching
 - [ ] 1 hot encode labels
-- [ ] batching
 - [ ] dropout?
 - [ ] cleanup

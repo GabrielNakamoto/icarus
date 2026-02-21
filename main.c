@@ -2,6 +2,8 @@
 #include <stdio.h>
 
 
+#define EPOCHS 20
+
 // https://medium.com/data-science/going-beyond-99-mnist-handwritten-digits-recognition-cfff96337392
 typedef struct {
 	layer_conv2d *l1, *l2;
@@ -96,10 +98,46 @@ void draw_mnist_digit(f32* data) {
     printf("\x1b[0m");
 }
 
+tensor **tensor_randombatch(tensor *x, tensor *y, i32 batch_size) {
+	i32 extra = 60000 % batch_size;
+	i32 n = (60000 / batch_size) + (60000%batch_size != 0);
+	tensor **batches = (tensor**)arena_alloc(sizeof(tensor*) * n * 2);
+
+	i32 indices[n];
+	for (i32 i=0; i<n; ++i) indices[i]=i;
+	// Fisher-Yates
+	for (i32 i=n-1; i>0; i--) {
+		i32 j = rand() % (i + 1);
+		i32 tmp = indices[i];
+		indices[i]=indices[j];
+		indices[j]=tmp;
+	}
+
+	for (i32 i=0; i<n; ++i) {
+		i32 shape[4] = { batch_size + (i==n-1 ? extra : 0), x->shape[1], x->shape[2], x->shape[3] };
+		tensor *t_x = alloc_tensor(shape, 4, 0, NEW, false);
+		tensor *t_y = alloc_tensor(shape, 4, 0, NEW, false);
+		f32 *data_x = &x->data[indices[i]*28*28];
+		f32 *data_y = &y->data[indices[i]*1];
+		memcpy(t_x->data, data_x, sizeof(f32) * 60000 * 28 * 28);
+		memcpy(t_y->data, data_y, sizeof(f32) * 60000 * 1);
+		copy_data(batches[i*2], t_x);
+		copy_data(batches[(i*2)+1], t_y);
+	}
+	return batches;
+}
+
 int main(int argc, char **argv) {
 	tensor *train_image_tensor, *train_label_tensor;
 	load_dataset(&train_image_tensor, &train_label_tensor, "train_images.raw", "train_labels.raw", 60000, 28, 28, 1, 10);
 
 	model_init();
 	draw_mnist_digit(train_image_tensor->data);
+
+	/*
+	for (i32 i=0; i<EPOCHS; ++i) {
+		tensor *pred = model_forward(train_image_tensor);
+		f32 loss = model_backward(pred, train_label_tensor);
+		printf("Epoch: %d\ttraining loss=%.2f\n", i, loss);
+	}*/
 }
