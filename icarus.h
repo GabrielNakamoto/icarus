@@ -23,6 +23,7 @@ void arena_clear() {
 	printf("Arena bytes used before clear: %ld\n", arena_offset);
 	arena_offset = 0;
 }
+
 void *arena_alloc(size_t size) {
 	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
 	// printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
@@ -37,7 +38,8 @@ typedef enum {
 	POW, EXP, LOG,
 	MUL, ADD,
 	SUM, MAX,
-	GEMM, RELU
+	GEMM, RELU,
+	IM2COL
 } tensor_op;
 
 const char* const op_names[] = {
@@ -67,7 +69,7 @@ typedef struct {
 	// Autograd fields
 	tensor_parent parent_r, parent_l;
 	tensor_op parent_op;
-	f32 grad_arg;
+	f32 grad_arg; i32 *col2im_args;
 	bool grad_keptdims, is_param;
 	void *grad; // tensor
 
@@ -109,7 +111,8 @@ tensor *tensor_softmax(tensor *t);
 tensor *tensor_relu(tensor *t);
 
 // CNN Ops
-tensor *tensor_im2col(tensor *im, int kh, int kw, int sh, int sw, int ph, int pw);
+tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides);
+tensor *tensor_col2im(tensor *cols, tensor *meta);
 
 // Helper funcs
 i32 get_size(i32 *shape, i32 ndims) {
@@ -395,6 +398,7 @@ tensor *tensor_backward(tensor *t) {
 			case SUM: dl = _unreduce_tensor(g, node, lp); break;
 			case MAX: dl = tensor_mul(_unreduce_tensor(g, node, lp), tensor_eq(_unreduce_tensor(node, node, lp), lp)); break;
 			case RELU: dl = tensor_mul(g, _tensor_reluback(lp)); break;
+			case IM2COL: dl = tensor_col2im(lg, lp); break;
 			default: continue; break;
 		}
 		if (node->parent_l.type == TENSOR) copy_data(lg, tensor_add(lg, dl));
@@ -422,6 +426,7 @@ void init_tensor(tensor *t, i32 *shape, i32 ndims, f32 init, tensor_op op, bool 
 	t->ndims = ndims; t->is_param = is_param;
 	t->data = data; t->grad = NULL;
 	t->shape = nshape; t->strides = strides;
+	t->col2im_args = NULL;
 }
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
@@ -457,28 +462,16 @@ layer_linear *linear_init(i32 inputs, i32 outputs) {
 }
 tensor *linear_forward(layer_linear *layer, tensor *x) { return tensor_add(tensor_gemm(x, layer->weights), layer->bias); }
 
-tensor *tensor_pad(tensor *t, i32 ph, i32 pw) {
-	i32 *nshape = (i32*)arena_alloc(t->ndims * sizeof(i32));
-	nshape[0]=t->shape[0]; nshape[3]=t->shape[3];
-	nshape[1]=t->shape[1] + ph * 2; nshape[2]=t->shape[2] + pw * 2;
-	// TODO: Copy autograd info??
-	tensor *pt = alloc_tensor(nshape, t->ndims, 0, NEW, false);
-	int indices[4] = { 0, 0, 0, 0 }; int pindices[4];
-	do {
-		memcpy(pindices, indices, 4 * sizeof(i32));
-		pindices[1]+=ph; pindices[2]+=pw;
-		f32 *c = tensor_getitem(pt, pt->strides, pindices);
-		*c = *tensor_getitem(t, t->strides, indices);
-	} while(inc_shapeindex(indices, t->shape, t->ndims) != -1);
-	return pt;
-}
-
-tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw) {
+tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 	i32 N = im->shape[0], h = im->shape[1], w=im->shape[2], c = im->shape[3];
-	i32 oh = floor((h - kh + ph*2) / sh) + 1, ow = floor((w - kw + pw*2) / sw) + 1;
-	im = tensor_pad(im, ph, pw);
-	i32 cshape[2] = { N * oh * ow, c * kh * kw};
-	tensor *cols = alloc_tensor(cshape, 2,0, NEW, false);
+	i32 oh = floor((h - ksize) / strides) + 1, ow = floor((w - ksize) / strides) + 1;
+	i32 cshape[2] = { N * oh * ow, c * ksize*ksize };
+	tensor *cols = alloc_tensor(cshape, 2,0, IM2COL, false);
+	cols->col2im_args = (i32*)malloc(8 * sizeof(i32));
+	cols->col2im_args[0] = ksize; cols->col2im_args[1] = strides;
+	cols->col2im_args[2] = oh; cols->col2im_args[3] = ow;
+	cols->col2im_args[4] = N; cols->col2im_args[5]=c;
+	cols->col2im_args[6] = h; cols->col2im_args[7]=w;
 
 	// TODO: parallelize?
 	i32 row=0;
@@ -486,10 +479,10 @@ tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw
 		for (int j=0; j<oh; ++j) {
 			for (int k=0; k<ow; ++k) {// Copy current kernel window into col
 				i32 col=0;
-				for (int kj=0; kj<kh; ++kj) {
-					for (int kk=0; kk<kw; ++kk) {
+				for (int kj=0; kj<ksize; ++kj) {
+					for (int kk=0; kk<ksize; ++kk) {
 						for (int cc=0; cc<c; ++cc) {
-							i32 iter[4] = { n, kj+j*sh, kk+k*sw, cc };
+							i32 iter[4] = { n, kj+j*strides, kk+k*strides, cc };
 							cols->data[row*cshape[1] + col]=*tensor_getitem(im, im->strides, iter);
 							col++;
 						}
@@ -502,24 +495,68 @@ tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw
 	return cols;
 }
 
+// Transform (N*oh*ow, kh*kw*c) -> (N, h, w, c)
+tensor *tensor_col2im(tensor *cols, tensor *meta) {
+	i32 N=meta->col2im_args[4], oh=meta->col2im_args[3], ow=meta->col2im_args[2];
+	i32 ksize=meta->col2im_args[1], strides=meta->col2im_args[0], c=meta->col2im_args[5];
+	i32 h=meta->col2im_args[6], w=meta->col2im_args[7];
+
+	i32 fanned[6] = { N, oh, ow, ksize, ksize, c };
+	tensor *dcols = tensor_reshape(cols, fanned, 6);
+	i32 imshape[4] = { N, h, w, c };
+	tensor *im = alloc_tensor(imshape, 4, 0, NEW, false);
+
+	for (int n=0; n<N; ++n) {
+		for (int j=0; j<oh; ++j) {
+			for (int k=0; k<ow; ++k) {
+				for (int kj=0; kj<ksize; ++kj) {
+					for (int kk=0; kk<ksize; ++kk) {
+						for (int cc=0; cc<c; ++cc) {
+							i32 iter[6] = { n, j, k, kj, kk, cc };
+							i32 im_iter[4] = { n, kj + j*strides, kk + k*strides, cc };
+							f32 *v = tensor_getitem(im, im->strides, im_iter);
+							*v += *tensor_getitem(dcols, dcols->strides, iter); 
+						}
+					}
+				}
+			}
+		}
+	}
+	return im;
+}
+
+tensor *tensor_maxpool2d(tensor *t, i32 psize, i32 strides) {
+	tensor *cols = tensor_im2col(t, psize, strides);
+	i32 N=t->shape[0], c=t->shape[3];
+	i32 oh=floor(t->shape[1]-psize / strides)+1, ow=floor(t->shape[2]-psize / strides)+1;
+	i32 sep[3] = { N*oh*ow, psize*psize, c };
+	i32 oshape[4] = { N, oh, ow, c };
+	cols = tensor_reshape(cols, sep, 3);
+	cols = tensor_max(cols, 1, true);
+	return tensor_reshape(cols, oshape, 4);
+}
+
 typedef struct {
 	tensor *weights, *bias;
-	i32 kstrides, ksize, padding, channels_in, channels_out;
+	i32 kstrides, ksize, channels_in, channels_out;
 } layer_conv2d;
 
-layer_conv2d *conv2d_init(i32 channels_in, i32 channels_out, i32 kstrides, i32 ksize, i32 padding) {
+layer_conv2d *conv2d_init(i32 channels_in, i32 channels_out, i32 kstrides, i32 ksize) {
 	layer_conv2d *layer = (layer_conv2d*)malloc(sizeof(layer_conv2d));
-	layer->kstrides=kstrides; layer->ksize=ksize; layer->padding=padding;
+	layer->kstrides=kstrides; layer->ksize=ksize;
 	layer->channels_in=channels_in; layer->channels_out=channels_out;
 	i32 wshape[4] = { ksize, ksize, channels_in, channels_out }; layer->weights = alloc_tensor(wshape, 4, 0, NEW, true);
 	i32 bshape[1] = { 1 }; layer->bias = alloc_tensor(bshape, 1, 0, NEW, true);
 	return layer;
 }
 tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
-	tensor *cols = tensor_im2col(x, layer->ksize, layer->ksize, layer->kstrides, layer->kstrides, layer->padding, layer->padding);
+	tensor *cols = tensor_im2col(x, layer->ksize, layer->kstrides);
 	i32 kshape[2] = { layer->ksize * layer->ksize * x->shape[3], layer->channels_out };
+	i32 oh=floor(x->shape[1]-layer->ksize / layer->kstrides)+1, ow=floor(x->shape[2]-layer->ksize / layer->kstrides)+1;
+	i32 oshape[4]={x->shape[0], oh, ow, x->shape[3]};
 	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); 
-	return tensor_add(tensor_gemm(cols, kernel), layer->bias);
+	tensor *out = tensor_add(tensor_gemm(cols, kernel), layer->bias);
+	return tensor_reshape(out, oshape, 4);
 }
 
 typedef struct {

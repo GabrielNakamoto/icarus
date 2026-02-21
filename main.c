@@ -18,12 +18,12 @@ typedef struct {
 static model net;
 
 void model_init() {
-	net.l1 = conv2d_init(1, 32, 1, 5, 0);
-	net.l2 = conv2d_init(32, 32, 1, 5, 0);
+	net.l1 = conv2d_init(1, 32, 1, 5);
+	net.l2 = conv2d_init(32, 32, 1, 5);
 	net.l3 = batchnorm_init(32);
 
-	net.l4 = conv2d_init(32, 64, 1, 3, 0);
-	net.l5 = conv2d_init(64, 64, 1, 3, 0);
+	net.l4 = conv2d_init(32, 64, 1, 3);
+	net.l5 = conv2d_init(64, 64, 1, 3);
 	net.l6 = batchnorm_init(64);
 
 	net.l7 = linear_init(576, 10);
@@ -44,10 +44,12 @@ tensor *model_forward(tensor *x) {
 	x = tensor_relu(conv2d_forward(net.l1, x));
 	x = conv2d_forward(net.l2, x);
 	x = tensor_relu(batchnorm_forward(net.l3, x));
+	x = tensor_maxpool2d(x, 2, 2);
 
 	x = tensor_relu(conv2d_forward(net.l4, x));
 	x = conv2d_forward(net.l5, x);
 	x = tensor_relu(batchnorm_forward(net.l6, x));
+	x = tensor_maxpool2d(x, 2, 2);
 
 	i32 flattened[2] = { x->shape[0], 576 };
 	x = tensor_reshape(x, flattened, 2);
