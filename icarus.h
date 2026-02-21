@@ -1,3 +1,5 @@
+#pragma once 
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -17,8 +19,11 @@ typedef char u8;
 static u8 arena_mem[ARENA_SIZE];
 static size_t arena_offset = 0;
 
-void arena_clear() { arena_offset = 0; }
-void *arena_alloc(u64 size) {
+void arena_clear() {
+	printf("Arena bytes used before clear: %ld\n", arena_offset);
+	arena_offset = 0;
+}
+void *arena_alloc(size_t size) {
 	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
 	// printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
 	if (arena_offset + padding + size > ARENA_SIZE) return NULL;
@@ -404,6 +409,7 @@ tensor *tensor_backward(tensor *t) {
 	return topo[n];
 }
 
+// TODO: use arena? do I need this function, usage kinda hacky
 tensor *duplicate_tensor(tensor *t) {
 	tensor *nt = (tensor*) malloc(sizeof(tensor));
 	memcpy(nt, t, sizeof(tensor));
@@ -426,18 +432,13 @@ void free_tensor(tensor *t) {
 }
 
 void init_tensor(tensor *t, i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
-	i32 size = get_size(shape, ndims);
-
 	i32 *nshape, *strides; f32 *data;
-	if (! is_param) {
-		nshape = (i32*) arena_alloc(ndims * sizeof(i32));
-		strides = (i32*) arena_alloc(ndims * sizeof(i32));
-		data = (f32*) arena_alloc(size * sizeof(f32));
-	} else {
-		nshape = (i32*) malloc(ndims * sizeof(i32));
-		strides = (i32*) malloc(ndims * sizeof(i32));
-		data = (f32*) malloc(size * sizeof(f32));
-	}
+	i32 size = get_size(shape, ndims);
+	void *(*alloc)(size_t) = is_param ? &arena_alloc : &malloc;
+
+	nshape = (i32*) alloc(ndims * sizeof(i32));
+	strides = (i32*) alloc(ndims * sizeof(i32));
+	data = (f32*) alloc(size * sizeof(f32));
 
 	calculate_strides(shape, ndims, &strides);
 	for (int i=0; i<size; ++i) data[i]=init;
@@ -456,13 +457,12 @@ tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_para
 	return t;
 }
 
-
 typedef struct {
 	tensor *weights, *bias;
 	i32 inputs, outputs;
 } layer_linear;
 
-layer_linear *init_linear(i32 inputs, i32 outputs) {
+layer_linear *linear_init(i32 inputs, i32 outputs) {
 	layer_linear *layer = (layer_linear*)malloc(sizeof(layer_linear));
 	layer->inputs = inputs; layer->outputs = outputs;
 	// TODO: heuristic weight init values
@@ -470,11 +470,7 @@ layer_linear *init_linear(i32 inputs, i32 outputs) {
 	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
 	return layer;
 }
-
-tensor *linear_forward(layer_linear *layer, tensor *x) {
-	tensor *y = tensor_gemm(x, layer->weights);
-	return tensor_add(y, layer->bias);
-}
+tensor *linear_forward(layer_linear *layer, tensor *x) { return tensor_add(tensor_gemm(x, layer->weights), layer->bias); }
 
 tensor *tensor_pad(tensor *t, i32 ph, i32 pw) {
 	i32 *nshape = (i32*)arena_alloc(t->ndims * sizeof(i32));
@@ -502,16 +498,14 @@ tensor *tensor_im2col(tensor *im, i32 kh, i32 kw, i32 sh, i32 sw, i32 ph, i32 pw
 
 	// TODO: parallelize?
 	i32 row=0;
-	// Iterate over # of distinct kernel windows
-	for (int n=0; n<N; ++n) {
+	for (int n=0; n<N; ++n) {// Iterate over # of distinct kernel windows
 		for (int j=0; j<oh; ++j) {
-			for (int k=0; k<ow; ++k) {
-				// Copy current kernel window int col
+			for (int k=0; k<ow; ++k) {// Copy current kernel window into col
 				i32 col=0;
 				for (int kj=0; kj<kh; ++kj) {
 					for (int kk=0; kk<kw; ++kk) {
 						for (int cc=0; cc<c; ++cc) {
-							i32 iter[4] = { n, kj+sh, kk+sw, cc };
+							i32 iter[4] = { n, kj+j*sh, kk+k*sw, cc };
 							cols->data[row*cshape[1] + col]=*tensor_getitem(im, im->strides, iter);
 							col++;
 						}
@@ -529,7 +523,7 @@ typedef struct {
 	i32 kstrides, ksize, padding, channels_in, channels_out;
 } layer_conv2d;
 
-layer_conv2d *init_conv2d(i32 channels_in, i32 channels_out, i32 kstrides, i32 ksize, i32 padding) {
+layer_conv2d *conv2d_init(i32 channels_in, i32 channels_out, i32 kstrides, i32 ksize, i32 padding) {
 	layer_conv2d *layer = (layer_conv2d*)malloc(sizeof(layer_conv2d));
 	layer->kstrides=kstrides; layer->ksize=ksize; layer->padding=padding;
 	layer->channels_in=channels_in; layer->channels_out=channels_out;
@@ -537,17 +531,35 @@ layer_conv2d *init_conv2d(i32 channels_in, i32 channels_out, i32 kstrides, i32 k
 	i32 bshape[1] = { 1 }; layer->bias = alloc_tensor(bshape, 1, 0, NEW, true);
 	return layer;
 }
-
 tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
 	tensor *cols = tensor_im2col(x, layer->ksize, layer->ksize, layer->kstrides, layer->kstrides, layer->padding, layer->padding);
 	i32 kshape[2] = { layer->ksize * layer->ksize * x->shape[3], layer->channels_out };
 	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); 
-	tensor *y = tensor_gemm(cols, kernel);
-	return tensor_add(y, layer->bias);
+	return tensor_add(tensor_gemm(cols, kernel), layer->bias);
 }
 
 typedef struct {
+	tensor *weights, *bias;
+	i32 channels;
 } layer_batchnorm;
+
+layer_batchnorm *batchnorm_init(i32 channels) {
+	layer_batchnorm *layer = (layer_batchnorm*)malloc(sizeof(layer_batchnorm));
+	i32 pshape[2] = { channels, 1 };
+	layer->channels = channels;
+	layer->weights = alloc_tensor(pshape, 2, 1, NEW, true);
+	layer->bias = alloc_tensor(pshape, 2, 1, NEW, true);
+	return layer;
+}
+
+tensor *batchnorm_forward(layer_batchnorm *layer, tensor *x) {
+	tensor *mean = x; tensor *var;
+	for (i32 i=0; i<x->ndims-1; ++i) mean = tensor_mean(mean, i, true);
+	var = tensor_pow(tensor_sub(x, mean), 2.0);
+	for (i32 i=0; i<x->ndims-1; ++i) var = tensor_mean(var, i, true);
+	x = tensor_div(tensor_sub(x, mean), tensor_sqrt(tensor_add_scalar(var, 1e-6)));
+	return tensor_add(tensor_mul(x, layer->weights), layer->bias);
+}
 
 typedef struct {
 	tensor **m, **v, **params;
@@ -555,12 +567,12 @@ typedef struct {
 	f32 b1, b2;
 } optim_ADAM;
 
-optim_ADAM *init_ADAM(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b2) {
+optim_ADAM *ADAM_init(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b2) {
 	optim_ADAM *adam = (optim_ADAM*)malloc(sizeof(optim_ADAM));
 	tensor **m = (tensor**)calloc(nparams, sizeof(tensor)), **v = (tensor**)calloc(nparams, sizeof(tensor));
 	for (i32 i=0; i<nparams; ++i) {
-		init_tensor(m[i], params[i]->shape, params[i]->ndims, 0, NEW, true);
-		init_tensor(v[i], params[i]->shape, params[i]->ndims, 0, NEW, true);
+		m[i] = alloc_tensor(params[i]->shape, params[i]->ndims, 0, NEW, true);
+		v[i] = alloc_tensor(params[i]->shape, params[i]->ndims, 0, NEW, true);
 	}
 	adam->params = params; adam->nparams = nparams;
 	adam->step_size = step_size; adam->b1 = b1; adam->b2 = b2;
@@ -568,9 +580,9 @@ optim_ADAM *init_ADAM(tensor **params, i32 nparams, i32 step_size, f32 b1, f32 b
 	return adam;
 }
 
-void step_ADAM(optim_ADAM *adam) {
+void ADAM_step(optim_ADAM *adam) {
 	adam->step++;
-	for (int i=0; i<adam->nparams; +i) {
+	for (int i=0; i<adam->nparams; ++i) {
 		tensor *g = (tensor*)adam->params[i]->grad;
 		adam->m[i]=tensor_add(tensor_mul_scalar(adam->m[i], adam->b1), tensor_mul_scalar(g, 1 - adam->b1));
 		adam->v[i]=tensor_add(tensor_mul_scalar(adam->v[i], adam->b2), tensor_mul_scalar(g, 1 - adam->b2));
