@@ -20,7 +20,8 @@ static u8 arena_mem[ARENA_SIZE];
 static size_t arena_offset = 0;
 
 void arena_clear() {
-	printf("Arena bytes used before clear: %ld\n", arena_offset);
+	size_t mbs = arena_offset / 1000000;
+	printf("Arena mbs used before clear: %ld\n", mbs);
 	arena_offset = 0;
 }
 
@@ -162,6 +163,11 @@ i32 inc_shapeindex(i32 *indices, i32 *shape, i32 ndims) {
 	return 1;
 }
 
+tensor *tensor_transpose2d(tensor *t) {
+	i32 nshape[2] = { t->shape[1], t->shape[0] };
+	return tensor_reshape(t, nshape, 2);
+}
+
 tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 	if (get_size(newshape, ndims) != get_size(t->shape, t->ndims)) return NULL;
 
@@ -176,12 +182,9 @@ tensor *tensor_apply_unop(tensor *t, f32 (*func)(f32, f32), f32 arg, tensor_op o
 	nt->parent_l.type = TENSOR; nt->parent_l.value.t = t;
 	nt->parent_r.type = NONE; nt->grad_arg = arg;
 
-	i32 *iter = (i32*)arena_alloc(t->ndims * sizeof(i32));
-	memset(iter, 0, t->ndims * sizeof(i32));
-	do {
-		f32 *b = tensor_getitem(nt, nt->strides, iter);
-		*b = func(*tensor_getitem(t, t->strides, iter), arg);
-	} while(inc_shapeindex(iter, t->shape, t->ndims) != -1);
+	#pragma omp parallel for
+	for (i32 i=0; i<get_size(t->shape, t->ndims); ++i)
+		nt->data[i]=func(t->data[i], arg);
 	return nt;
 }
 
@@ -205,13 +208,32 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 	c->parent_l.type = TENSOR; c->parent_l.value.t = a;
 	c->parent_r.type = TENSOR; c->parent_r.value.t = b;
 
-	i32 *a_bstrides = broadcast_strides(a); i32 *b_bstrides = broadcast_strides(b);
-	i32 *iter = (i32*)arena_alloc(a->ndims * sizeof(i32));
-	memset(iter, 0, a->ndims * sizeof(i32));
-	do {
-		f32 *cv = tensor_getitem(c, c->strides, iter);
-		*cv = func(*tensor_getitem(a, a_bstrides, iter), *tensor_getitem(b, b_bstrides, iter));
-	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
+	bool same_shape = true;
+	for (i32 i=0; i<a->ndims; ++i) if (a->shape[i] != b->shape[i]) same_shape=false;
+
+	i32 M=c->shape[0], N=c->shape[1];
+	if (same_shape) {
+		#pragma omp parallel for
+		for (i32 i=0; i<get_size(a->shape, a->ndims); ++i)
+			c->data[i]=func(a->data[i], b->data[i]);
+	} else if (a->shape[0] == 1 || b->shape[0] == 1) {
+		f32 *row = a->shape[0] == 1 ? a->data : b->data;
+		f32 *big = a->shape[0] == 1 ? b->data : a->data;
+		#pragma omp parallel for
+		for (i32 i=0; i<M; ++i)
+			for (i32 j=0; j<N; ++j)
+				c->data[i*N + j]=func(row[j], big[i*N + j]);
+	} else if (a->shape[1] == 1 || b->shape[1] == 1) {
+		f32 *col = a->shape[1] == 1 ? a->data : b->data;
+		f32 *big = a->shape[1] == 1 ? b->data : a->data;
+		#pragma omp parallel for
+		for (i32 i=0; i<M; ++i)
+			for (i32 j=0; j<N; ++j)
+				c->data[i*N + j]=func(col[i], big[i*N + j]);
+	} else {
+		printf("Invalid elemwise op\n");
+		exit(0);
+	}
 
 	return c;
 }
@@ -407,7 +429,10 @@ tensor *tensor_backward(tensor *t) {
 			case MAX: dl = tensor_mul(_unreduce_tensor(g, node, lp), tensor_eq(_unreduce_tensor(node, node, lp), lp)); break;
 			case RELU: dl = tensor_mul(g, _tensor_reluback(lp)); break;
 			case IM2COL: dl = tensor_col2im(lg, lp); break;
-			case GEMM: break; // TODO: gemm backward
+			case GEMM:
+				dl = tensor_gemm(g, tensor_transpose2d(rp));
+				dr = tensor_gemm(tensor_transpose2d(lp), g);
+				break;
 			default: continue; break;
 		}
 		if (node->parent_l.type == TENSOR) copy_data(lg, tensor_add(lg, dl));
@@ -465,12 +490,14 @@ void init_he(tensor *weights, i32 n) {
 layer_linear *linear_init(i32 inputs, i32 outputs) {
 	layer_linear *layer = (layer_linear*)malloc(sizeof(layer_linear));
 	layer->inputs = inputs; layer->outputs = outputs;
-	i32 wshape[2] = { outputs, inputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW, true);
+	i32 wshape[2] = { inputs, outputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW, true);
 	init_he(layer->weights, outputs * inputs);
 	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
 	return layer;
 }
-tensor *linear_forward(layer_linear *layer, tensor *x) { return tensor_add(tensor_gemm(x, layer->weights), layer->bias); }
+tensor *linear_forward(layer_linear *layer, tensor *x) {
+	return tensor_add(tensor_gemm(x, layer->weights), layer->bias);
+}
 
 tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 	i32 N = im->shape[0], h = im->shape[1], w=im->shape[2], c = im->shape[3];
@@ -566,7 +593,6 @@ tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
 	i32 oshape[4]={x->shape[0], oh, ow, layer->channels_out };
 	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); 
 	tensor *out = tensor_add(tensor_gemm(cols, kernel), layer->bias);
-	printf("Kernel applied...\n");
 	return tensor_reshape(out, oshape, 4);
 }
 
