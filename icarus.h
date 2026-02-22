@@ -8,7 +8,7 @@
 #include <sys/types.h>
 
 #define MAX_TOPO_NODES 1024
-#define ARENA_SIZE 256*1024*1024 // 256mb
+#define ARENA_SIZE (1024*1024*1024) // 1gb
 #define ARENA_ALIGN 64
 
 typedef float f32;
@@ -27,7 +27,10 @@ void arena_clear() {
 void *arena_alloc(size_t size) {
 	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
 	// printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
-	if (arena_offset + padding + size > ARENA_SIZE) return NULL;
+	if (arena_offset + padding + size > ARENA_SIZE) {
+		printf("WARNING: Arena out of memory!\n");
+		return NULL;
+	}
 	void *ptr = arena_mem + arena_offset + padding;
 	arena_offset += padding + size;
 	return ptr;
@@ -281,16 +284,21 @@ tensor *tensor_sum(tensor *t, i32 axis, bool keepdims) { return tensor_apply_red
 tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -INFINITY, MAX); }
 tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) { return tensor_mul_scalar(tensor_sum(t, axis, keepdims), 1.0 / (f32)t->shape[axis]); }
 
+// Reshape
 tensor *tensor_gemm(tensor *a, tensor *b) {
 	if (a->shape[1] != b->shape[0]) return NULL;
-	i32 ash[3] = { a->shape[0], a->shape[1], 1 };
-	i32 bsh[3] = { 1, b->shape[0], b->shape[1] };
+	i32 M=a->shape[0], K=a->shape[1], N=b->shape[1];
+	i32 cshape[2] = { M, N };
+	tensor *c = alloc_tensor(cshape, 2, 0, GEMM, false);
+	c->parent_l.type = TENSOR; c->parent_l.value.t=a;
+	c->parent_r.type = TENSOR; c->parent_r.value.t=b;
 
-	a = tensor_reshape(a, ash, 3);
-	b = tensor_reshape(b, bsh, 3);
-	tensor *c = tensor_mul(a, b);
-
-	return tensor_sum(c, 1, false);
+#pragma omp parallel for
+	for (i32 i=0; i<M; ++i)
+		for (i32 j=0; j<K; ++j)
+			for (i32 k=0; k<N; ++k)
+				c->data[i*N+k] += a->data[i*K+j]*b->data[j*N+k];
+	return c;
 }
 
 tensor *tensor_logsoftmax(tensor *t) {
@@ -399,6 +407,7 @@ tensor *tensor_backward(tensor *t) {
 			case MAX: dl = tensor_mul(_unreduce_tensor(g, node, lp), tensor_eq(_unreduce_tensor(node, node, lp), lp)); break;
 			case RELU: dl = tensor_mul(g, _tensor_reluback(lp)); break;
 			case IM2COL: dl = tensor_col2im(lg, lp); break;
+			case GEMM: break; // TODO: gemm backward
 			default: continue; break;
 		}
 		if (node->parent_l.type == TENSOR) copy_data(lg, tensor_add(lg, dl));
@@ -468,17 +477,17 @@ tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 	i32 oh = floor((h - ksize) / strides) + 1, ow = floor((w - ksize) / strides) + 1;
 	i32 cshape[2] = { N * oh * ow, c * ksize*ksize };
 	tensor *cols = alloc_tensor(cshape, 2,0, IM2COL, false);
-	cols->col2im_args = (i32*)malloc(8 * sizeof(i32));
+	cols->col2im_args = (i32*)arena_alloc(8 * sizeof(i32));
 	cols->col2im_args[0] = ksize; cols->col2im_args[1] = strides;
 	cols->col2im_args[2] = oh; cols->col2im_args[3] = ow;
 	cols->col2im_args[4] = N; cols->col2im_args[5]=c;
 	cols->col2im_args[6] = h; cols->col2im_args[7]=w;
 
-	// TODO: parallelize?
-	i32 row=0;
+	#pragma omp parallel for collapse(3)
 	for (int n=0; n<N; ++n) {// Iterate over # of distinct kernel windows
 		for (int j=0; j<oh; ++j) {
 			for (int k=0; k<ow; ++k) {// Copy current kernel window into col
+				i32 row=n*oh*ow +j*ow + k;
 				i32 col=0;
 				for (int kj=0; kj<ksize; ++kj) {
 					for (int kk=0; kk<ksize; ++kk) {
@@ -489,7 +498,6 @@ tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 						}
 					}
 				}
-				row++;
 			}
 		}
 	}
@@ -507,6 +515,7 @@ tensor *tensor_col2im(tensor *cols, tensor *meta) {
 	i32 imshape[4] = { N, h, w, c };
 	tensor *im = alloc_tensor(imshape, 4, 0, NEW, false);
 
+	#pragma omp parallel for
 	for (int n=0; n<N; ++n) {
 		for (int j=0; j<oh; ++j) {
 			for (int k=0; k<ow; ++k) {
@@ -529,7 +538,7 @@ tensor *tensor_col2im(tensor *cols, tensor *meta) {
 tensor *tensor_maxpool2d(tensor *t, i32 psize, i32 strides) {
 	tensor *cols = tensor_im2col(t, psize, strides);
 	i32 N=t->shape[0], c=t->shape[3];
-	i32 oh=floor(t->shape[1]-psize / strides)+1, ow=floor(t->shape[2]-psize / strides)+1;
+	i32 oh=floor((t->shape[1]-psize) / strides)+1, ow=floor((t->shape[2]-psize) / strides)+1;
 	i32 sep[3] = { N*oh*ow, psize*psize, c };
 	i32 oshape[4] = { N, oh, ow, c };
 	cols = tensor_reshape(cols, sep, 3);
@@ -547,16 +556,17 @@ layer_conv2d *conv2d_init(i32 channels_in, i32 channels_out, i32 kstrides, i32 k
 	layer->kstrides=kstrides; layer->ksize=ksize;
 	layer->channels_in=channels_in; layer->channels_out=channels_out;
 	i32 wshape[4] = { ksize, ksize, channels_in, channels_out }; layer->weights = alloc_tensor(wshape, 4, 0, NEW, true);
-	i32 bshape[1] = { 1 }; layer->bias = alloc_tensor(bshape, 1, 0, NEW, true);
+	i32 bshape[2] = { 1, channels_out }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
 	return layer;
 }
 tensor *conv2d_forward(layer_conv2d *layer, tensor *x) {
 	tensor *cols = tensor_im2col(x, layer->ksize, layer->kstrides);
 	i32 kshape[2] = { layer->ksize * layer->ksize * x->shape[3], layer->channels_out };
-	i32 oh=floor(x->shape[1]-layer->ksize / layer->kstrides)+1, ow=floor(x->shape[2]-layer->ksize / layer->kstrides)+1;
-	i32 oshape[4]={x->shape[0], oh, ow, x->shape[3]};
+	i32 oh=floor((x->shape[1]-layer->ksize) / layer->kstrides)+1, ow=floor((x->shape[2]-layer->ksize) / layer->kstrides)+1;
+	i32 oshape[4]={x->shape[0], oh, ow, layer->channels_out };
 	tensor *kernel = tensor_reshape(layer->weights, kshape, 2); 
 	tensor *out = tensor_add(tensor_gemm(cols, kernel), layer->bias);
+	printf("Kernel applied...\n");
 	return tensor_reshape(out, oshape, 4);
 }
 

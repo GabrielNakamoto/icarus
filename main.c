@@ -48,19 +48,27 @@ void model_init() {
 
 tensor *model_forward(tensor *x) {
 	printf("Model forward pass...\n");
+	printf("Layer 1...\n");
 	x = tensor_relu(conv2d_forward(net.l1, x));
+	printf("Layer 2...\n");
 	x = conv2d_forward(net.l2, x);
+	printf("Layer 3...\n");
 	x = tensor_relu(batchnorm_forward(net.l3, x));
 	x = tensor_maxpool2d(x, 2, 2);
 
+	printf("Layer 4...\n");
 	x = tensor_relu(conv2d_forward(net.l4, x));
+	printf("Layer 5...\n");
 	x = conv2d_forward(net.l5, x);
+	printf("Layer 6...\n");
 	x = tensor_relu(batchnorm_forward(net.l6, x));
 	x = tensor_maxpool2d(x, 2, 2);
 
-	i32 flattened[2] = { x->shape[0], 576 };
+	printf("Flattening channels...\n");
+	i32 flattened[2] = { 576, 1 };
 	x = tensor_reshape(x, flattened, 2);
 
+	printf("Layer 7...\n");
 	return linear_forward(net.l7, x);
 }
 
@@ -148,7 +156,7 @@ int main(int argc, char **argv) {
 	preallocate_batches(train_image_tensor, train_label_tensor);
 	printf("Done.\n");
 
-	// model_init();
+	model_init();
 
 	for (i32 i=0; i<EPOCHS; ++i) {
 		shuffle_batches();
@@ -158,6 +166,7 @@ int main(int argc, char **argv) {
 			tensor *x=&batches[b*2], *y=&batches[(b*2)+1];
 			draw_mnist_digit(x[0].data);
 			tensor *pred = model_forward(x);
+			printf("Forward done.\n");
 			// model_backward(pred, y);
 			arena_clear();
 		}
