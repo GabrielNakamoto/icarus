@@ -65,12 +65,17 @@ tensor *model_forward(tensor *x) {
 }
 
 f32 model_backward(tensor *y_hat, tensor *y) {
-	tensor *loss = tensor_sparse_categorical_crossentropy_loss(y_hat, y);
+	tensor *J = tensor_sparse_categorical_crossentropy_loss(y_hat, y);
+	tensor *loss = tensor_mean(J, 0, false);
 
 	tensor_backward(loss);
+	printf("Backwards done.\n");
+	printf("Optimizing...\n");
 	ADAM_step(net.optim);
 
+	printf("Zero grad...\n");
 	zero_grads(net.optim->params, net.optim->nparams);
+	return loss->data[0];
 }
 
 void load_dataset(tensor **t_images, tensor **t_labels, const char *images_filename, const char *labels_filename, i32 samples, i32 width, i32 height, i32 channels, i32 classes) {
@@ -116,6 +121,8 @@ void preallocate_batches(tensor *X, tensor *Y) {
 		x->ndims=4;
 		x->shape[0]=BATCH_SIZE; x->shape[1]=28; x->shape[2]=28; x->shape[3]=1;
 		calculate_strides(x->shape, 4, &x->strides);
+		x->parent_l.type = NONE; x->parent_r.type = NONE;
+		x->parent_op = NEW; x->grad = NULL; x->is_param = false;
 		x->data=&batch_data_arena[i * BATCH_SIZE * (28*28 + 10)];
 		memcpy(x->data, &X->data[i*BATCH_SIZE*28*28], get_size(x->shape, x->ndims) * sizeof(f32));
 
@@ -124,6 +131,8 @@ void preallocate_batches(tensor *X, tensor *Y) {
 		y->ndims=2;
 		y->shape[0]=BATCH_SIZE; y->shape[1]=10;
 		calculate_strides(y->shape, 2, &y->strides);
+		y->parent_l.type = NONE; y->parent_r.type = NONE;
+		y->parent_op = NEW; y->grad = NULL; y->is_param = false;
 		y->data=&batch_data_arena[i * BATCH_SIZE * (28*28 + 10) + BATCH_SIZE * 28 * 28];
 		memcpy(y->data, &Y->data[i*BATCH_SIZE*10], get_size(y->shape, y->ndims) * sizeof(f32));
 	}
@@ -140,6 +149,7 @@ void shuffle_batches() {
 }
 
 int main(int argc, char **argv) {
+	arena_init();
 	omp_set_num_threads(4); // Physical cores
 
 	tensor *train_image_tensor, *train_label_tensor;
@@ -159,7 +169,9 @@ int main(int argc, char **argv) {
 			tensor *x=&batches[b*2], *y=&batches[(b*2)+1];
 			tensor *pred = model_forward(x);
 			printf("Forward done.\n");
-			// model_backward(pred, y);
+			f32 loss = model_backward(pred, y);
+			printf("Backward done, loss=%.2f\n", loss);
+
 			arena_clear();
 		}
 		printf("Epoch: %d\n", i);

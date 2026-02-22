@@ -8,6 +8,7 @@ To do:
 - [x] im2col backwards
 - [x] max pool 2d layer
 - [x] batching
-- [ ] 1 hot encode labels
+- [x] 1 hot encode labels
+- [ ] FASTER
 - [ ] dropout?
 - [ ] cleanup

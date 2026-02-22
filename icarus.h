@@ -6,9 +6,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/mman.h>
 
 #define MAX_TOPO_NODES 1024
-#define ARENA_SIZE (1024*1024*1024) // 1gb
+#define ARENA_SIZE (2UL*1024*1024*1024) // 2gb
 #define ARENA_ALIGN 64
 
 typedef float f32;
@@ -16,8 +17,13 @@ typedef int i32;
 typedef long u64;
 typedef char u8;
 
-static u8 arena_mem[ARENA_SIZE];
+static u8 *arena_mem = NULL;
 static size_t arena_offset = 0;
+
+void arena_init() {
+	arena_mem = (u8*)mmap(NULL, ARENA_SIZE, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+	if (arena_mem == MAP_FAILED) { perror("mmap"); exit(1); }
+}
 
 void arena_clear() {
 	size_t mbs = arena_offset / 1000000;
@@ -27,7 +33,6 @@ void arena_clear() {
 
 void *arena_alloc(size_t size) {
 	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
-	// printf("Allocating %ld bytes on arena with padding: %ld...\n", size, padding);
 	if (arena_offset + padding + size > ARENA_SIZE) {
 		printf("WARNING: Arena out of memory!\n");
 		return NULL;
@@ -48,7 +53,7 @@ typedef enum {
 
 const char* const op_names[] = {
     "NEW", "RESHAPE", "POW", "EXP", "LOG", "MUL",
-		"ADD", "SUM", "MAX", "GEMM", "RELU",
+		"ADD", "SUM", "MAX", "GEMM", "RELU", "IM2COL"
 };
 
 typedef union {
@@ -240,18 +245,12 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 
 tensor *tensor_apply_biop_scalar(tensor *a, f32 b, f32 (*func)(f32, f32), tensor_op op) {
 	tensor *c = alloc_tensor(a->shape, a->ndims, 0, op, false);
-
-	i32 *a_bstrides = broadcast_strides(a);
-	i32 *iter = (i32*)arena_alloc(a->ndims * sizeof(i32));
-	memset(iter, 0, a->ndims * sizeof(i32));
-
 	c->parent_l.type = TENSOR; c->parent_l.value.t = a;
 	c->parent_r.type = SCALAR; c->parent_r.value.s = b;
 
-	do {
-		f32 *cv = tensor_getitem(c, c->strides, iter);
-		*cv = func(*tensor_getitem(a, a_bstrides, iter), b);
-	} while (inc_shapeindex(iter, c->shape, c->ndims) != -1);
+	#pragma omp parallel for
+	for (i32 i=0; i<get_size(a->shape, a->ndims); ++i) 
+		c->data[i]=func(a->data[i], b);
 
 	return c;
 }
@@ -306,7 +305,6 @@ tensor *tensor_sum(tensor *t, i32 axis, bool keepdims) { return tensor_apply_red
 tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_reduceop(t, axis, keepdims, &__max, -INFINITY, MAX); }
 tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) { return tensor_mul_scalar(tensor_sum(t, axis, keepdims), 1.0 / (f32)t->shape[axis]); }
 
-// Reshape
 tensor *tensor_gemm(tensor *a, tensor *b) {
 	if (a->shape[1] != b->shape[0]) return NULL;
 	i32 M=a->shape[0], K=a->shape[1], N=b->shape[1];
@@ -408,7 +406,7 @@ tensor *tensor_backward(tensor *t) {
 		}
 
 		switch (node->parent_op) {
-			case NEW: continue; break;
+			case NEW: break;
 			case RESHAPE: dl = tensor_reshape(g, lp->shape, lp->ndims); break;
 			case POW: dl = tensor_mul(g, tensor_mul_scalar(tensor_pow(lp, node->grad_arg-1), node->grad_arg)); break;
 			case EXP: dl = tensor_mul(g, node); break;
@@ -428,7 +426,7 @@ tensor *tensor_backward(tensor *t) {
 			case SUM: dl = _unreduce_tensor(g, node, lp); break;
 			case MAX: dl = tensor_mul(_unreduce_tensor(g, node, lp), tensor_eq(_unreduce_tensor(node, node, lp), lp)); break;
 			case RELU: dl = tensor_mul(g, _tensor_reluback(lp)); break;
-			case IM2COL: dl = tensor_col2im(lg, lp); break;
+			case IM2COL: dl = tensor_col2im(g, node); break;
 			case GEMM:
 				dl = tensor_gemm(g, tensor_transpose2d(rp));
 				dr = tensor_gemm(tensor_transpose2d(lp), g);
@@ -461,7 +459,7 @@ void init_tensor(tensor *t, i32 *shape, i32 ndims, f32 init, tensor_op op, bool 
 	t->ndims = ndims; t->is_param = is_param;
 	t->data = data; t->grad = NULL;
 	t->shape = nshape; t->strides = strides;
-	t->col2im_args = NULL;
+	t->col2im_args = (i32*)alloc(8 * sizeof(i32));
 }
 
 tensor *alloc_tensor(i32 *shape, i32 ndims, f32 init, tensor_op op, bool is_param) {
@@ -504,7 +502,7 @@ tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 	i32 oh = floor((h - ksize) / strides) + 1, ow = floor((w - ksize) / strides) + 1;
 	i32 cshape[2] = { N * oh * ow, c * ksize*ksize };
 	tensor *cols = alloc_tensor(cshape, 2,0, IM2COL, false);
-	cols->col2im_args = (i32*)arena_alloc(8 * sizeof(i32));
+	cols->parent_l.type = TENSOR; cols->parent_l.value.t=im;
 	cols->col2im_args[0] = ksize; cols->col2im_args[1] = strides;
 	cols->col2im_args[2] = oh; cols->col2im_args[3] = ow;
 	cols->col2im_args[4] = N; cols->col2im_args[5]=c;
@@ -533,8 +531,8 @@ tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 
 // Transform (N*oh*ow, kh*kw*c) -> (N, h, w, c)
 tensor *tensor_col2im(tensor *cols, tensor *meta) {
-	i32 N=meta->col2im_args[4], oh=meta->col2im_args[3], ow=meta->col2im_args[2];
-	i32 ksize=meta->col2im_args[1], strides=meta->col2im_args[0], c=meta->col2im_args[5];
+	i32 N=meta->col2im_args[4], oh=meta->col2im_args[2], ow=meta->col2im_args[3];
+	i32 ksize=meta->col2im_args[0], strides=meta->col2im_args[1], c=meta->col2im_args[5];
 	i32 h=meta->col2im_args[6], w=meta->col2im_args[7];
 
 	i32 fanned[6] = { N, oh, ow, ksize, ksize, c };
