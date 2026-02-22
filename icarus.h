@@ -1,4 +1,4 @@
-#pragma once 
+#pragma once
 
 #include <math.h>
 #include <stdbool.h>
@@ -7,8 +7,17 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/mman.h>
+#include <omp.h>
 
 #define MAX_TOPO_NODES 1024
+
+// Profiling
+static double prof_gemm=0, prof_im2col=0, prof_col2im=0, prof_reduce=0, prof_unreduce=0, prof_biop=0, prof_unop=0;
+void prof_print() {
+	printf("PROFILE: gemm=%.3f im2col=%.3f col2im=%.3f reduce=%.3f unreduce=%.3f biop=%.3f unop=%.3f\n",
+		prof_gemm, prof_im2col, prof_col2im, prof_reduce, prof_unreduce, prof_biop, prof_unop);
+}
+void prof_reset() { prof_gemm=prof_im2col=prof_col2im=prof_reduce=prof_unreduce=prof_biop=prof_unop=0; }
 #define ARENA_SIZE (2UL*1024*1024*1024) // 2gb
 #define ARENA_ALIGN 64
 
@@ -185,6 +194,7 @@ tensor *tensor_reshape(tensor *t, i32 *newshape, i32 ndims) {
 }
 
 tensor *tensor_apply_unop(tensor *t, f32 (*func)(f32, f32), f32 arg, tensor_op op) {
+	double _t0 = omp_get_wtime();
 	tensor *nt = alloc_tensor(t->shape, t->ndims, 0, op, false);
 	nt->parent_l.type = TENSOR; nt->parent_l.value.t = t;
 	nt->parent_r.type = NONE; nt->grad_arg = arg;
@@ -192,6 +202,7 @@ tensor *tensor_apply_unop(tensor *t, f32 (*func)(f32, f32), f32 arg, tensor_op o
 	#pragma omp parallel for
 	for (i32 i=0; i<get_size(t->shape, t->ndims); ++i)
 		nt->data[i]=func(t->data[i], arg);
+	prof_unop += omp_get_wtime() - _t0;
 	return nt;
 }
 
@@ -208,6 +219,7 @@ tensor *tensor_relu(tensor *t) { return tensor_apply_unop(t, &_relu, -1, RELU); 
 tensor *_tensor_reluback(tensor *t) { return tensor_apply_unop(t, &_relu_back, -1, RELU); }
 
 tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op op) {
+	double _t0 = omp_get_wtime();
 	if (a->ndims != b->ndims) return NULL;
 	i32 *cshape = broadcast_shape(a->shape, b->shape, a->ndims);
 	tensor *c = alloc_tensor(cshape, a->ndims, 0, op, false);
@@ -242,6 +254,7 @@ tensor *tensor_apply_biop(tensor *a, tensor *b, f32 (*func)(f32, f32), tensor_op
 		exit(0);
 	}
 
+	prof_biop += omp_get_wtime() - _t0;
 	return c;
 }
 
@@ -269,6 +282,7 @@ tensor *tensor_mul_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a,
 tensor *tensor_add_scalar(tensor *a, f32 b) { return tensor_apply_biop_scalar(a, b, &__add, ADD); }
 
 tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f32*, f32), f32 init, tensor_op op) {
+	double _t0 = omp_get_wtime();
 	i32 *nshape;
 	if (! keepdims) {
 		nshape = (i32*)arena_alloc((t->ndims-1) * sizeof(i32));
@@ -284,21 +298,44 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 	r->parent_r.type = NONE;
 	r->grad_keptdims = keepdims; r->grad_arg = axis;
 
-	i32 *riter = (i32*)arena_alloc(r->ndims * sizeof(i32)), *iter = (i32*)arena_alloc(t->ndims * sizeof(i32));
-	memset(riter, 0, r->ndims * sizeof(i32));
 
-	// TODO: parallelize?
-	do {
-		if (!keepdims) {
-			for (i32 i=0; i<r->ndims; ++i) iter[i + (i >= axis)]=riter[i];
-		} else memcpy(iter, riter, t->ndims * sizeof(i32));
-		f32 *a = tensor_getitem(r, r->strides, riter);
-		*a = init;
-		for (i32 i=0; i<t->shape[axis]; ++i) {
-			iter[axis]=i;
-			func(a, *tensor_getitem(t, t->strides, iter));
+	if (t->ndims == 2) {
+		if (axis == 1) {
+			#pragma omp parallel for
+			for (i32 i=0; i<t->shape[0]; ++i)
+				for (i32 j=0; j<t->shape[1]; ++j)
+					r->data[i]+=t->data[i*t->shape[1] + j];
+		} else {
+			// Prevent race conditions
+			#pragma omp parallel
+			{
+				f32 *local = (f32*)calloc(t->shape[1], sizeof(f32));
+				#pragma omp for
+				for (i32 i=0; i<t->shape[0]; ++i)
+					for (i32 j=0; j<t->shape[1]; ++j)
+						local[j]+=t->data[i*t->shape[1] + j];
+				#pragma omp critical
+				for (i32 i=0; i<t->shape[1]; ++i) r->data[i] += local[i];
+				free(local);
+			}
 		}
-	} while (inc_shapeindex(riter, r->shape, r->ndims) != -1);
+	} else {
+		i32 *riter = (i32*)arena_alloc(r->ndims * sizeof(i32)), *iter = (i32*)arena_alloc(t->ndims * sizeof(i32));
+		memset(riter, 0, r->ndims * sizeof(i32));
+		// TODO: parallelize?
+		do {
+			if (!keepdims) {
+				for (i32 i=0; i<r->ndims; ++i) iter[i + (i >= axis)]=riter[i];
+			} else memcpy(iter, riter, t->ndims * sizeof(i32));
+			f32 *a = tensor_getitem(r, r->strides, riter);
+			*a = init;
+			for (i32 i=0; i<t->shape[axis]; ++i) {
+				iter[axis]=i;
+				func(a, *tensor_getitem(t, t->strides, iter));
+			}
+		} while (inc_shapeindex(riter, r->shape, r->ndims) != -1);
+	}
+	prof_reduce += omp_get_wtime() - _t0;
 	return r;
 }
 
@@ -309,6 +346,7 @@ tensor *tensor_max(tensor *t, i32 axis, bool keepdims) { return tensor_apply_red
 tensor *tensor_mean(tensor *t, i32 axis, bool keepdims) { return tensor_mul_scalar(tensor_sum(t, axis, keepdims), 1.0 / (f32)t->shape[axis]); }
 
 tensor *tensor_gemm(tensor *a, tensor *b) {
+	double _t0 = omp_get_wtime();
 	if (a->shape[1] != b->shape[0]) return NULL;
 	i32 M=a->shape[0], K=a->shape[1], N=b->shape[1];
 	i32 cshape[2] = { M, N };
@@ -316,11 +354,26 @@ tensor *tensor_gemm(tensor *a, tensor *b) {
 	c->parent_l.type = TENSOR; c->parent_l.value.t=a;
 	c->parent_r.type = TENSOR; c->parent_r.value.t=b;
 
-#pragma omp parallel for
-	for (i32 i=0; i<M; ++i)
-		for (i32 j=0; j<K; ++j)
-			for (i32 k=0; k<N; ++k)
-				c->data[i*N+k] += a->data[i*K+j]*b->data[j*N+k];
+	// TODO: better understand this Tile optimization by Claude
+	#define TILE 64
+	#pragma omp parallel for collapse(2)
+	for (i32 ii=0; ii<M; ii+=TILE) {
+		for (i32 kk=0; kk<N; kk+=TILE) {
+			i32 i_end = ii+TILE < M ? ii+TILE : M;
+			i32 k_end = kk+TILE < N ? kk+TILE : N;
+			for (i32 jj=0; jj<K; jj+=TILE) {
+				i32 j_end = jj+TILE < K ? jj+TILE : K;
+				for (i32 i=ii; i<i_end; ++i)
+					for (i32 j=jj; j<j_end; ++j) {
+						f32 aij = a->data[i*K+j];
+						for (i32 k=kk; k<k_end; ++k)
+							c->data[i*N+k] += aij * b->data[j*N+k];
+					}
+			}
+		}
+	}
+	#undef TILE
+	prof_gemm += omp_get_wtime() - _t0;
 	return c;
 }
 
@@ -353,6 +406,7 @@ void try_init_parent_grad(tensor_parent *parent) {
 
 // Broadcasts reduced tensor to match parent shape for backprop
 tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
+	double _t0 = omp_get_wtime();
 	tensor *broadcast_g = alloc_tensor(node->shape, node->ndims, 0, NEW, false);
 	copy_data(broadcast_g, from);
 
@@ -374,6 +428,7 @@ tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 		f32 *pv = tensor_getitem(t, parent->strides, indices);
 		*pv = *tensor_getitem(broadcast_g, bstrides, indices);
 	} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
+	prof_unreduce += omp_get_wtime() - _t0;
 	return t;
 }
 
@@ -506,6 +561,7 @@ tensor *linear_forward(layer_linear *layer, tensor *x) {
 }
 
 tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
+	double _t0 = omp_get_wtime();
 	i32 N = im->shape[0], h = im->shape[1], w=im->shape[2], c = im->shape[3];
 	i32 oh = floor((h - ksize) / strides) + 1, ow = floor((w - ksize) / strides) + 1;
 	i32 cshape[2] = { N * oh * ow, c * ksize*ksize };
@@ -522,49 +578,51 @@ tensor *tensor_im2col(tensor *im, i32 ksize, i32 strides) {
 			for (int k=0; k<ow; ++k) {// Copy current kernel window into col
 				i32 row=n*oh*ow +j*ow + k;
 				i32 col=0;
+				i32 im_base = n*h*w*c;
 				for (int kj=0; kj<ksize; ++kj) {
+					i32 im_row = (kj + j*strides) * w * c;
 					for (int kk=0; kk<ksize; ++kk) {
-						for (int cc=0; cc<c; ++cc) {
-							i32 iter[4] = { n, kj+j*strides, kk+k*strides, cc };
-							cols->data[row*cshape[1] + col]=*tensor_getitem(im, im->strides, iter);
-							col++;
-						}
+						i32 im_off = im_base + im_row + (kk + k*strides) * c;
+						for (int cc=0; cc<c; ++cc)
+							cols->data[row*cshape[1] + col++]=im->data[im_off + cc];
 					}
 				}
 			}
 		}
 	}
+	prof_im2col += omp_get_wtime() - _t0;
 	return cols;
 }
 
 // Transform (N*oh*ow, kh*kw*c) -> (N, h, w, c)
 tensor *tensor_col2im(tensor *cols, tensor *meta) {
+	double _t0 = omp_get_wtime();
 	i32 N=meta->col2im_args[4], oh=meta->col2im_args[2], ow=meta->col2im_args[3];
 	i32 ksize=meta->col2im_args[0], strides=meta->col2im_args[1], c=meta->col2im_args[5];
 	i32 h=meta->col2im_args[6], w=meta->col2im_args[7];
 
-	i32 fanned[6] = { N, oh, ow, ksize, ksize, c };
-	tensor *dcols = tensor_reshape(cols, fanned, 6);
 	i32 imshape[4] = { N, h, w, c };
 	tensor *im = alloc_tensor(imshape, 4, 0, NEW, false);
+	i32 col_width = ksize*ksize*c;
 
 	#pragma omp parallel for
 	for (int n=0; n<N; ++n) {
+		i32 off_base = n*h*w*c;
 		for (int j=0; j<oh; ++j) {
 			for (int k=0; k<ow; ++k) {
+				i32 row =n*ow*ow + j*ow + k;
 				for (int kj=0; kj<ksize; ++kj) {
+					i32 off_row = (kj + j*strides) * w * c;
 					for (int kk=0; kk<ksize; ++kk) {
-						for (int cc=0; cc<c; ++cc) {
-							i32 iter[6] = { n, j, k, kj, kk, cc };
-							i32 im_iter[4] = { n, kj + j*strides, kk + k*strides, cc };
-							f32 *v = tensor_getitem(im, im->strides, im_iter);
-							*v += *tensor_getitem(dcols, dcols->strides, iter); 
-						}
+						i32 off = off_base + off_row + (kk * k*strides) * c;
+						for (int cc=0; cc<c; ++cc)
+							im->data[off+cc] += cols->data[row*col_width + (kj*ksize + kk)*c + cc];
 					}
 				}
 			}
 		}
 	}
+	prof_col2im += omp_get_wtime() - _t0;
 	return im;
 }
 
