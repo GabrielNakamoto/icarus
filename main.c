@@ -69,11 +69,8 @@ f32 model_backward(tensor *y_hat, tensor *y) {
 	tensor *loss = tensor_mean(J, 0, false);
 
 	tensor_backward(loss);
-	printf("Backwards done.\n");
-	printf("Optimizing...\n");
 	ADAM_step(net.optim);
 
-	printf("Zero grad...\n");
 	zero_grads(net.optim->params, net.optim->nparams);
 	return loss->data[0];
 }
@@ -164,16 +161,17 @@ int main(int argc, char **argv) {
 
 	for (i32 i=0; i<EPOCHS; ++i) {
 		shuffle_batches();
+		f32 total_loss = 0.0;
 		for (i32 j=0; j<NBATCHES; ++j) {
+			printf("Batch %d/%d...\n", j+1, NBATCHES);
 			i32 b=batch_indices[j];
 			tensor *x=&batches[b*2], *y=&batches[(b*2)+1];
 			tensor *pred = model_forward(x);
-			printf("Forward done.\n");
 			f32 loss = model_backward(pred, y);
-			printf("Backward done, loss=%.2f\n", loss);
+			total_loss += loss;
 
 			arena_clear();
 		}
-		printf("Epoch: %d\n", i);
+		printf("Epoch: %d\tloss=%.2f\n", i, total_loss / NBATCHES);
 	}
 }

@@ -25,11 +25,7 @@ void arena_init() {
 	if (arena_mem == MAP_FAILED) { perror("mmap"); exit(1); }
 }
 
-void arena_clear() {
-	size_t mbs = arena_offset / 1000000;
-	printf("Arena mbs used before clear: %ld\n", mbs);
-	arena_offset = 0;
-}
+void arena_clear() { arena_offset = 0; }
 
 void *arena_alloc(size_t size) {
 	size_t padding = ARENA_ALIGN - (arena_offset % ARENA_ALIGN);
@@ -131,6 +127,12 @@ i32 get_size(i32 *shape, i32 ndims) {
 }
 
 void copy_data(tensor *dst, tensor *src) { memcpy(dst->data, src->data, get_size(dst->shape, dst->ndims) * sizeof(f32)); }
+
+void tensor_accumulate(tensor *dst, tensor *src) {
+	#pragma omp parallel for
+	for (i32 i=0; i<get_size(dst->shape, dst->ndims); ++i)
+		dst->data[i]+=src->data[i];
+}
 
 void calculate_strides(i32 *shape, i32 ndims, i32 **strides) {
 	(*strides)[ndims-1]=1;
@@ -285,6 +287,7 @@ tensor *tensor_apply_reduceop(tensor *t, i32 axis, bool keepdims, void (*func)(f
 	i32 *riter = (i32*)arena_alloc(r->ndims * sizeof(i32)), *iter = (i32*)arena_alloc(t->ndims * sizeof(i32));
 	memset(riter, 0, r->ndims * sizeof(i32));
 
+	// TODO: parallelize?
 	do {
 		if (!keepdims) {
 			for (i32 i=0; i<r->ndims; ++i) iter[i + (i >= axis)]=riter[i];
@@ -354,7 +357,7 @@ tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 	copy_data(broadcast_g, from);
 
 	tensor *t = alloc_tensor(parent->shape, parent->ndims, 0, NEW, false);
-	i32 axis = node->grad_arg;
+	i32 axis = (i32)node->grad_arg;
 
 	if (! node->grad_keptdims) {
 		i32 *nshape = (i32*)arena_alloc(parent->ndims * sizeof(i32));
@@ -386,7 +389,13 @@ tensor *tensor_backward(tensor *t) {
 	i32 n =0, ns = 0;
 	topo_dfs(t, topo, seen, &n, &ns);
 
-	t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW, t->is_param);
+	if (t->grad == NULL) {
+		t->grad = alloc_tensor(t->shape, t->ndims, 1.0f, NEW, t->is_param);
+	} else {
+		i32 size = get_size(t->shape, t->ndims);
+		f32 *d = ((tensor*)t->grad)->data;
+		for (i32 i = 0; i < size; ++i) d[i] = 1.0f;
+	}
 	for (i32 i=n-1; i>0; i--) {
 		tensor *node = topo[i];
 		tensor *g = (tensor*)node->grad;
@@ -433,10 +442,9 @@ tensor *tensor_backward(tensor *t) {
 				break;
 			default: continue; break;
 		}
-		if (node->parent_l.type == TENSOR) copy_data(lg, tensor_add(lg, dl));
-		if (node->parent_r.type == TENSOR) copy_data(rg, tensor_add(rg, dr));
+		if (node->parent_l.type == TENSOR) tensor_accumulate(lg, dl);
+		if (node->parent_r.type == TENSOR) tensor_accumulate(rg, dr);
 	}
-	// arena_clear();
 	return topo[n];
 }
 
@@ -637,10 +645,14 @@ optim_ADAM *ADAM_init(tensor **params, i32 nparams, f32 step_size, f32 b1, f32 b
 	optim_ADAM *adam = (optim_ADAM*)malloc(sizeof(optim_ADAM));
 	tensor **m = (tensor**)calloc(nparams, sizeof(tensor)), **v = (tensor**)calloc(nparams, sizeof(tensor));
 	for (i32 i=0; i<nparams; ++i) {
+		params[i]->grad = alloc_tensor(params[i]->shape, params[i]->ndims, 0, NEW, true);
 		m[i] = alloc_tensor(params[i]->shape, params[i]->ndims, 0, NEW, true);
 		v[i] = alloc_tensor(params[i]->shape, params[i]->ndims, 0, NEW, true);
 	}
-	adam->params = params; adam->nparams = nparams;
+	adam->m=m; adam->v=v;
+	adam->params = (tensor**)malloc(nparams * sizeof(tensor*));
+	memcpy(adam->params, params, nparams * sizeof(tensor*));
+	adam->nparams = nparams;
 	adam->step_size = step_size; adam->b1 = b1; adam->b2 = b2;
 	adam->step = 0;
 	return adam;
@@ -648,15 +660,22 @@ optim_ADAM *ADAM_init(tensor **params, i32 nparams, f32 step_size, f32 b1, f32 b
 
 void ADAM_step(optim_ADAM *adam) {
 	adam->step++;
+	f32 bc1 = 1.0f - powf(adam->b1, adam->step);
+	f32 bc2 = 1.0f - powf(adam->b2, adam->step);
 	for (int i=0; i<adam->nparams; ++i) {
-		tensor *g = (tensor*)adam->params[i]->grad;
-		tensor *m =tensor_add(tensor_mul_scalar(adam->m[i], adam->b1), tensor_mul_scalar(g, 1 - adam->b1));
-		tensor *v =tensor_add(tensor_mul_scalar(adam->v[i], adam->b2), tensor_mul_scalar(g, 1 - adam->b2));
-		tensor *m_hat = tensor_mul_scalar(m, 1.0 / (1.0 - powf(adam->b1, adam->step)));
-		tensor *v_hat = tensor_mul_scalar(v, 1.0 / (1.0 - powf(adam->b2, adam->step)));
-		tensor *out = tensor_sub(adam->params[i], tensor_mul_scalar(tensor_div(m_hat, tensor_add_scalar(tensor_sqrt(v_hat), 1e-6)), adam->step_size));
-		copy_data(adam->m[i], m);
-		copy_data(adam->v[i], v);
-		copy_data(adam->params[i], out);
+		if (adam->params[i]== NULL || !adam->params[i]->grad) {
+			printf("ADAM found dirty grad.\n");
+			continue;
+		}
+		tensor *p=adam->params[i], *g = (tensor*)p->grad;
+		i32 size = get_size(p->shape, p->ndims);
+		#pragma omp parallel for
+		for (i32 j=0; j<size; ++j) {
+			adam->m[i]->data[j] = adam->b1 * adam->m[i]->data[j] + (1-adam->b1) * g->data[j];
+			adam->v[i]->data[j] = adam->b2 * adam->v[i]->data[j] + (1-adam->b2) * g->data[j] * g->data[j];
+			f32 mh = adam->m[i]->data[j] / bc1;
+			f32 vh = adam->v[i]->data[j] / bc2;
+			p->data[j] -= adam->step_size * mh / (sqrtf(vh) + 1e-6f);
+		}
 	}
 }
