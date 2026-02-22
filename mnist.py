@@ -19,8 +19,8 @@ test_images, test_labels = ds_to_numpy(test_ds)
 train_images = train_images.astype(np.float32) / 255.0
 test_images = test_images.astype(np.float32) / 255.0
 
-train_labels = train_labels.astype(np.float32)
-test_labels = test_labels.astype(np.float32)
+train_labels = np.eye(10, dtype=np.float32)[train_labels.astype(int)]
+test_labels = np.eye(10, dtype=np.float32)[test_labels.astype(int)]
 
 train_images.tofile("train_images.raw")
 train_labels.tofile("train_labels.raw")

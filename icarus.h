@@ -121,7 +121,7 @@ i32 get_size(i32 *shape, i32 ndims) {
 	return size;
 }
 
-void copy_data(tensor *dst, tensor *src) { memcpy(dst->data, src->data, get_size(src->shape, src->ndims) * sizeof(f32)); }
+void copy_data(tensor *dst, tensor *src) { memcpy(dst->data, src->data, get_size(dst->shape, dst->ndims) * sizeof(f32)); }
 
 void calculate_strides(i32 *shape, i32 ndims, i32 **strides) {
 	(*strides)[ndims-1]=1;
@@ -404,7 +404,7 @@ tensor *tensor_backward(tensor *t) {
 		if (node->parent_l.type == TENSOR) copy_data(lg, tensor_add(lg, dl));
 		if (node->parent_r.type == TENSOR) copy_data(rg, tensor_add(rg, dr));
 	}
-	arena_clear();
+	// arena_clear();
 	return topo[n];
 }
 
@@ -418,7 +418,8 @@ void init_tensor(tensor *t, i32 *shape, i32 ndims, f32 init, tensor_op op, bool 
 	data = (f32*) alloc(size * sizeof(f32));
 
 	calculate_strides(shape, ndims, &strides);
-	for (int i=0; i<size; ++i) data[i]=init;
+	if (init == 0.0f) memset(data, 0.0f, size * sizeof(f32));
+	else for (int i=0; i<size; ++i) data[i]=init;
 	memcpy(nshape, shape, ndims * sizeof(i32));
 
 	t->parent_op = op;

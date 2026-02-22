@@ -3,6 +3,10 @@
 
 
 #define EPOCHS 20
+#define BATCH_SIZE 128
+#define SAMPLES 60000
+#define NBATCHES ((SAMPLES/BATCH_SIZE)+(SAMPLES % BATCH_SIZE != 0))
+
 
 // https://medium.com/data-science/going-beyond-99-mnist-handwritten-digits-recognition-cfff96337392
 typedef struct {
@@ -43,6 +47,7 @@ void model_init() {
 }
 
 tensor *model_forward(tensor *x) {
+	printf("Model forward pass...\n");
 	x = tensor_relu(conv2d_forward(net.l1, x));
 	x = conv2d_forward(net.l2, x);
 	x = tensor_relu(batchnorm_forward(net.l3, x));
@@ -68,10 +73,9 @@ f32 model_backward(tensor *y_hat, tensor *y) {
 	zero_grads(net.optim->params, net.optim->nparams);
 }
 
-// TODO: convert labels to one hot, maybe do this before serializing to raw floats
 void load_dataset(tensor **t_images, tensor **t_labels, const char *images_filename, const char *labels_filename, i32 samples, i32 width, i32 height, i32 channels, i32 classes) {
 	i32 ishape[4] = { samples, height, width, channels };
-	i32 lshape[2] = { samples, 1 };
+	i32 lshape[2] = { samples, classes };
 
 	*t_images = alloc_tensor(ishape, 4, 0, NEW, true);
 	*t_labels = alloc_tensor(lshape, 2, 0, NEW, true);
@@ -80,7 +84,7 @@ void load_dataset(tensor **t_images, tensor **t_labels, const char *images_filen
 	FILE *f_labels = fopen(labels_filename, "rb");
 
 	fread((*t_images)->data, 1, sizeof(f32) * samples * width * height * channels, f_images);
-	fread((*t_labels)->data, 1, sizeof(f32) * samples * 1, f_labels);
+	fread((*t_labels)->data, 1, sizeof(f32) * samples * classes, f_labels);
 
 	fclose(f_images);
 	fclose(f_labels);;
@@ -98,46 +102,65 @@ void draw_mnist_digit(f32* data) {
     printf("\x1b[0m");
 }
 
-tensor **tensor_randombatch(tensor *x, tensor *y, i32 batch_size) {
-	i32 extra = 60000 % batch_size;
-	i32 n = (60000 / batch_size) + (60000%batch_size != 0);
-	tensor **batches = (tensor**)arena_alloc(sizeof(tensor*) * n * 2);
+tensor batches[NBATCHES*2];
+i32 batch_indices[NBATCHES];
+f32 batch_data_arena[NBATCHES * BATCH_SIZE * (28*28 + 10)];
+i32 batch_meta_arena[NBATCHES * 12];
+void preallocate_batches(tensor *X, tensor *Y) {
+	for (i32 i=0; i<NBATCHES; ++i) {
+		batch_indices[i]=i;
+		tensor *x=&batches[i*2], *y=&batches[(i*2)+1];
 
-	i32 indices[n];
-	for (i32 i=0; i<n; ++i) indices[i]=i;
-	// Fisher-Yates
-	for (i32 i=n-1; i>0; i--) {
+		x->shape=&batch_meta_arena[i*12];
+		x->strides=&batch_meta_arena[(i*12)+4];
+		x->ndims=4;
+		x->shape[0]=BATCH_SIZE; x->shape[1]=28; x->shape[2]=28; x->shape[3]=1;
+		calculate_strides(x->shape, 4, &x->strides);
+		x->data=&batch_data_arena[i * BATCH_SIZE * (28*28 + 10)];
+		memcpy(x->data, &X->data[i*BATCH_SIZE*28*28], get_size(x->shape, x->ndims) * sizeof(f32));
+
+		y->shape=&batch_meta_arena[(i*12)+8];
+		y->strides=&batch_meta_arena[(i*12)+10];
+		y->ndims=2;
+		y->shape[0]=BATCH_SIZE; y->shape[1]=10;
+		calculate_strides(y->shape, 2, &y->strides);
+		y->data=&batch_data_arena[i * BATCH_SIZE * (28*28 + 10) + BATCH_SIZE * 28 * 28];
+		memcpy(y->data, &Y->data[i*BATCH_SIZE*10], get_size(y->shape, y->ndims) * sizeof(f32));
+	}
+}
+
+// Fisher-Yates
+void shuffle_batches() {
+	for (i32 i=NBATCHES-1; i>0; i--) {
 		i32 j = rand() % (i + 1);
-		i32 tmp = indices[i];
-		indices[i]=indices[j];
-		indices[j]=tmp;
+		i32 tmp = batch_indices[i];
+		batch_indices[i]=batch_indices[j];
+		batch_indices[j]=tmp;
 	}
-
-	for (i32 i=0; i<n; ++i) {
-		i32 shape[4] = { batch_size + (i==n-1 ? extra : 0), x->shape[1], x->shape[2], x->shape[3] };
-		tensor *t_x = alloc_tensor(shape, 4, 0, NEW, false);
-		tensor *t_y = alloc_tensor(shape, 4, 0, NEW, false);
-		f32 *data_x = &x->data[indices[i]*28*28];
-		f32 *data_y = &y->data[indices[i]*1];
-		memcpy(t_x->data, data_x, sizeof(f32) * 60000 * 28 * 28);
-		memcpy(t_y->data, data_y, sizeof(f32) * 60000 * 1);
-		copy_data(batches[i*2], t_x);
-		copy_data(batches[(i*2)+1], t_y);
-	}
-	return batches;
 }
 
 int main(int argc, char **argv) {
 	tensor *train_image_tensor, *train_label_tensor;
+	printf("Loading dataset tensors...\n");
 	load_dataset(&train_image_tensor, &train_label_tensor, "train_images.raw", "train_labels.raw", 60000, 28, 28, 1, 10);
+	printf("Done.\nPreallocating training batches...\n");
 
-	model_init();
-	draw_mnist_digit(train_image_tensor->data);
+	preallocate_batches(train_image_tensor, train_label_tensor);
+	printf("Done.\n");
 
-	/*
+	// model_init();
+
 	for (i32 i=0; i<EPOCHS; ++i) {
-		tensor *pred = model_forward(train_image_tensor);
-		f32 loss = model_backward(pred, train_label_tensor);
-		printf("Epoch: %d\ttraining loss=%.2f\n", i, loss);
-	}*/
+		shuffle_batches();
+		for (i32 j=0; j<NBATCHES; ++j) {
+			printf("Training batch: %d\r", j);
+			i32 b=batch_indices[j];
+			tensor *x=&batches[b*2], *y=&batches[(b*2)+1];
+			draw_mnist_digit(x[0].data);
+			tensor *pred = model_forward(x);
+			// model_backward(pred, y);
+			arena_clear();
+		}
+		printf("Epoch: %d\n", i);
+	}
 }
