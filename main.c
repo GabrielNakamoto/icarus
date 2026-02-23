@@ -3,7 +3,7 @@
 #include <stdio.h>
 
 
-#define EPOCHS 1
+#define EPOCHS 10
 #define BATCH_SIZE 128
 #define SAMPLES 60000
 #define NBATCHES ((SAMPLES/BATCH_SIZE)+(SAMPLES % BATCH_SIZE != 0))
@@ -163,7 +163,7 @@ int main(int argc, char **argv) {
 		shuffle_batches();
 		f32 total_loss = 0.0;
 		for (i32 j=0; j<NBATCHES; ++j) {
-				i32 b=batch_indices[j];
+			i32 b=batch_indices[j];
 			tensor *x=&batches[b*2], *y=&batches[(b*2)+1];
 			double t0 = omp_get_wtime();
 			tensor *pred = model_forward(x);
@@ -171,11 +171,13 @@ int main(int argc, char **argv) {
 			f32 loss = model_backward(pred, y);
 			double t2 = omp_get_wtime();
 			total_loss += loss;
-			printf("Batch %d/%d  fwd=%.3fs bwd=%.3fs, loss=%.3f\n", j+1, NBATCHES, t1-t0, t2-t1, loss);
-			prof_print(); prof_reset();
+			printf("Batch %d/%d  fwd=%.3fs bwd=%.3fs, loss=%.3f\r", j+1, NBATCHES, t1-t0, t2-t1, loss);
+			fflush(stdout);
+			// prof_print();
+			prof_reset();
 
 			arena_clear();
 		}
-		printf("Epoch: %d\tloss=%.2f\n", i, total_loss / NBATCHES);
+		printf("\nEpoch: %d\tloss=%.2f\n", i, total_loss / NBATCHES);
 	}
 }

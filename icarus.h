@@ -354,25 +354,14 @@ tensor *tensor_gemm(tensor *a, tensor *b) {
 	c->parent_l.type = TENSOR; c->parent_l.value.t=a;
 	c->parent_r.type = TENSOR; c->parent_r.value.t=b;
 
-	// TODO: better understand this Tile optimization by Claude
-	#define TILE 64
-	#pragma omp parallel for collapse(2)
-	for (i32 ii=0; ii<M; ii+=TILE) {
-		for (i32 kk=0; kk<N; kk+=TILE) {
-			i32 i_end = ii+TILE < M ? ii+TILE : M;
-			i32 k_end = kk+TILE < N ? kk+TILE : N;
-			for (i32 jj=0; jj<K; jj+=TILE) {
-				i32 j_end = jj+TILE < K ? jj+TILE : K;
-				for (i32 i=ii; i<i_end; ++i)
-					for (i32 j=jj; j<j_end; ++j) {
-						f32 aij = a->data[i*K+j];
-						for (i32 k=kk; k<k_end; ++k)
-							c->data[i*N+k] += aij * b->data[j*N+k];
-					}
-			}
+	#pragma omp parallel for
+	for (int i=0; i<M; ++i) {
+		for (int k=0; k<K; ++k) {
+			f32 a_val = a->data[i*K + k];
+			for (int j=0; j<N; ++j)
+				c->data[i*N + j]+=a_val*b->data[k*N + j];
 		}
 	}
-	#undef TILE
 	prof_gemm += omp_get_wtime() - _t0;
 	return c;
 }
@@ -421,13 +410,28 @@ tensor *_unreduce_tensor(tensor *from, tensor *node, tensor *parent) {
 		broadcast_g = tensor_reshape(broadcast_g, nshape, parent->ndims);
 	}
 
-	i32 *bstrides = broadcast_strides(broadcast_g);
-	i32 *indices = (i32*)arena_alloc(parent->ndims * sizeof(i32));
-	memset(indices, 0, parent->ndims * sizeof(i32));
-	do {
-		f32 *pv = tensor_getitem(t, parent->strides, indices);
-		*pv = *tensor_getitem(broadcast_g, bstrides, indices);
-	} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
+	if (parent->ndims == 2) {
+		i32 M = parent->shape[0], N = parent->shape[1];
+		if (axis == 1) {
+			#pragma omp parallel for
+			for (i32 i=0; i<M; ++i)
+				for (i32 j=0; j<N; ++j)
+					t->data[i*N + j] = broadcast_g->data[i];
+		} else {
+			#pragma omp parallel for
+			for (i32 i=0; i<M; ++i)
+				for (i32 j=0; j<N; ++j)
+					t->data[i*N + j] = broadcast_g->data[j];
+		}
+	} else {
+		i32 *bstrides = broadcast_strides(broadcast_g);
+		i32 *indices = (i32*)arena_alloc(parent->ndims * sizeof(i32));
+		memset(indices, 0, parent->ndims * sizeof(i32));
+		do {
+			f32 *pv = tensor_getitem(t, parent->strides, indices);
+			*pv = *tensor_getitem(broadcast_g, bstrides, indices);
+		} while (inc_shapeindex(indices, parent->shape, parent->ndims) != -1);
+	}
 	prof_unreduce += omp_get_wtime() - _t0;
 	return t;
 }
@@ -553,7 +557,7 @@ layer_linear *linear_init(i32 inputs, i32 outputs) {
 	layer->inputs = inputs; layer->outputs = outputs;
 	i32 wshape[2] = { inputs, outputs }; layer->weights = alloc_tensor(wshape, 2, 0, NEW, true);
 	init_he(layer->weights, outputs * inputs);
-	i32 bshape[2] = { outputs, 1 }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
+	i32 bshape[2] = { 1, outputs }; layer->bias = alloc_tensor(bshape, 2, 0, NEW, true);
 	return layer;
 }
 tensor *linear_forward(layer_linear *layer, tensor *x) {
