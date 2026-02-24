@@ -2,7 +2,10 @@
 #include "icarus.h"
 #include <stdio.h>
 
+int main(int argc, char** argv) {
+}
 
+/*
 #define EPOCHS 10
 #define BATCH_SIZE 128
 #define SAMPLES 60000
@@ -107,28 +110,21 @@ void draw_mnist_digit(f32* data) {
 tensor batches[NBATCHES*2];
 i32 batch_indices[NBATCHES];
 f32 batch_data_arena[NBATCHES * BATCH_SIZE * (28*28 + 10)];
-i32 batch_meta_arena[NBATCHES * 12];
 void preallocate_batches(tensor *X, tensor *Y) {
 	for (i32 i=0; i<NBATCHES; ++i) {
 		batch_indices[i]=i;
 		tensor *x=&batches[i*2], *y=&batches[(i*2)+1];
 
-		x->shape=&batch_meta_arena[i*12];
-		x->strides=&batch_meta_arena[(i*12)+4];
 		x->ndims=4;
 		x->shape[0]=BATCH_SIZE; x->shape[1]=28; x->shape[2]=28; x->shape[3]=1;
-		calculate_strides(x->shape, 4, &x->strides);
-		x->parent_l.type = NONE; x->parent_r.type = NONE;
+		calculate_strides(x->shape, 4, x->strides);
 		x->parent_op = NEW; x->grad = NULL; x->is_param = false;
 		x->data=&batch_data_arena[i * BATCH_SIZE * (28*28 + 10)];
 		memcpy(x->data, &X->data[i*BATCH_SIZE*28*28], get_size(x->shape, x->ndims) * sizeof(f32));
 
-		y->shape=&batch_meta_arena[(i*12)+8];
-		y->strides=&batch_meta_arena[(i*12)+10];
 		y->ndims=2;
 		y->shape[0]=BATCH_SIZE; y->shape[1]=10;
-		calculate_strides(y->shape, 2, &y->strides);
-		y->parent_l.type = NONE; y->parent_r.type = NONE;
+		calculate_strides(y->shape, 2, y->strides);
 		y->parent_op = NEW; y->grad = NULL; y->is_param = false;
 		y->data=&batch_data_arena[i * BATCH_SIZE * (28*28 + 10) + BATCH_SIZE * 28 * 28];
 		memcpy(y->data, &Y->data[i*BATCH_SIZE*10], get_size(y->shape, y->ndims) * sizeof(f32));
@@ -181,3 +177,4 @@ int main(int argc, char **argv) {
 		printf("\nEpoch: %d\tloss=%.2f\n", i, total_loss / NBATCHES);
 	}
 }
+*/
