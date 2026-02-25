@@ -13,6 +13,7 @@
 #define MAX_TOPO_NODES 512
 #define ARENA_SIZE (2UL*1024*1024*1024) // 2gb
 #define ARENA_ALIGN 64
+#define MAX_PARAMS 20
 
 typedef float f32;
 typedef int i32;
@@ -41,7 +42,7 @@ void *arena_alloc(size_t size) {
 }
 
 typedef enum {
-	CREATE, RESHAPE, ADD, MUL, GEMM, RELU, IM2COL, CROSS_ENTROPY
+	CREATE, RESHAPE, ADD, MUL, GEMM, RELU, IM2COL, CROSS_ENTROPY, MAX
 } Op;
 
 
@@ -49,10 +50,10 @@ typedef enum {
 	TEMP, PARAM, SHALLOW
 } alloc_type;
 
-#define MAX_DIMS 4
-#define SHAPE_2D(prefix, a, b) i32 prefix ## _shape[MAX_DIMS]; prefix ## _shape[0]=a; prefix ## _shape[1]=b; 
-#define SHAPE_4D(prefix, a, b, c, d) i32 prefix ## _shape[MAX_DIMS]; prefix ## _shape[0]=a; prefix ## _shape[1]=b; prefix ## _shape[2]=c; prefix ## _shape[3] = d;
 
+#define MAX_DIMS 4
+#define SHAPE_2D(prefix, a, b) i32 prefix ## _shape[MAX_DIMS]; prefix ## _shape[0]=a; prefix ## _shape[1]=b;
+#define SHAPE_4D(prefix, a, b, c, d) i32 prefix ## _shape[MAX_DIMS]; prefix ## _shape[0]=a; prefix ## _shape[1]=b; prefix ## _shape[2]=c; prefix ## _shape[3]=d;
 typedef struct {
 	bool visited; void *grad;
 	void *parent_l, *parent_r;
@@ -64,6 +65,8 @@ typedef struct {
 	i32 ndims, shape[MAX_DIMS], strides[MAX_DIMS];
 	f32 *data;
 } tensor;
+
+typedef void (*backward_fn)(tensor *node, tensor *grad);
 
 typedef struct {
 	i32 inputs, outputs;
@@ -79,6 +82,13 @@ typedef struct {
 	i32 ksize, stride, in_channels, out_channels;
 	tensor *kernel, *bias;
 } conv2d_layer;
+
+typedef struct {
+	i32 nparams;
+	tensor *m[MAX_PARAMS], *v[MAX_PARAMS], *params[MAX_PARAMS];
+	f32 step_size, b1, b2;
+	i32 step;
+} ADAM;
 
 i32 get_size(tensor *t) {
 	i32 size = 1;
@@ -106,6 +116,15 @@ tensor *new_tensor(i32 ndims, i32 *shape, alloc_type type) {
 	t->strides[ndims-1]=1;
 	for (i32 i=ndims-2; i>=0; i--) t->strides[i]=t->shape[i+1]*t->strides[i+1];
 	return t;
+}
+
+tensor *tensor2d(i32 r, i32 c, alloc_type t) {
+	i32 shape[MAX_DIMS]; shape[0]=r; shape[1]=c;
+	return new_tensor(2, shape, t);
+}
+tensor *tensor24(i32 n, i32 h, i32 w, i32 c, alloc_type t) {
+	i32 shape[MAX_DIMS]; shape[0]=n; shape[1]=h; shape[2]=w; shape[3]=c;
+	return new_tensor(4, shape, t);
 }
 
 /*
@@ -170,8 +189,7 @@ tensor *gemm2d(tensor *__restrict__ a, tensor *__restrict__ b) {
 	if (a->shape[1] != b->shape[0]) return NULL;
 
 	i32 M=a->shape[0], N=a->shape[1], P=b->shape[1];
-	SHAPE_2D(c, M, P)
-	tensor *c = new_tensor(2, c_shape, TEMP);
+	tensor *c = tensor2d(M, P, TEMP);
 	c->op = GEMM; c->parent_l = a; c->parent_r = b;
 	memset(c->data, 0, M * P * sizeof(f32));
 
@@ -204,8 +222,7 @@ tensor *relu(tensor *x, bool back) {
 */
 tensor *sparse_crossentropy(tensor *__restrict__ y, tensor *__restrict__ y_hat) {
 	i32 N = y_hat->shape[0], C = y_hat->shape[1];
-	SHAPE_2D(l, N, 1)
-	tensor *l = new_tensor(2, l_shape, TEMP);
+	tensor *l = tensor2d(N, 1, TEMP);
 	l->op = CROSS_ENTROPY; l->parent_l = y_hat; l->parent_r = y;
 
 	#pragma omp parallel for
@@ -259,8 +276,7 @@ tensor *reshape(tensor *t, i32 ndims, i32 *shape) {
 }
 
 tensor *transpose2d(tensor *__restrict__ t) {
-	SHAPE_2D(trans, t->shape[1], t->shape[0])
-	tensor *__restrict__ T = new_tensor(t->ndims, trans_shape, TEMP);
+	tensor *__restrict__ T = tensor2d(t->shape[1], t->shape[0], TEMP);
 	#pragma omp parallel for collapse(2)
 	for (i32 i=0; i<t->shape[0]; ++i) 
 			for (i32 j=0; j<t->shape[1]; ++j)
@@ -277,8 +293,7 @@ static inline i32 calculate_kernel_dim(i32 dimshape, i32 ksize, i32 kstride) { r
 tensor *im2col(tensor *__restrict__ im, i32 size, i32 strides) {
 	i32 N=im->shape[0], H=im->shape[1], W=im->shape[2], C=im->shape[3];
 	i32 os = calculate_kernel_dim(H, size, strides);
-	SHAPE_2D(flat, N*os*os, size*size*C)
-	tensor *cols = new_tensor(2, flat_shape, TEMP); 
+	tensor *cols = tensor2d(N*os*os, size*size*C, TEMP); 
 	cols->op = IM2COL; cols->parent_l = im; cols->col2im_stride = strides;
 
 	#pragma omp parallel for collapse(3)
@@ -312,7 +327,9 @@ tensor *col2im(tensor *__restrict__ cols, tensor *__restrict__ im) {
 	i32 os = sqrt(cols->shape[0]/N), ksize=sqrt(cols->shape[1]/C), stride=cols->col2im_stride;
 	tensor *out = new_tensor(im->ndims, im->shape, TEMP);
 	memset(out->data, 0, get_size(out) * sizeof(f32));
+
 	// Iterate over output pos (n, h, w)
+	#pragma omp parallel for
 	for (i32 n=0; n<N; ++n) {
 		i32 window_offset = n*os*os;
 		for (i32 h=0; h<os; ++h) {
@@ -336,6 +353,30 @@ tensor *col2im(tensor *__restrict__ cols, tensor *__restrict__ im) {
 	return out;
 }
 
+
+/*
+ * Reduces a 2d tensor with a max operation across
+ * the specified axis
+ * - keeps dims
+ */
+tensor *max_reduce2d(tensor *x, i32 axis) {
+	i32 N=x->shape[0], M=x->shape[1];
+	i32 outer = axis == 0 ? M : N, inner = axis == 0 ? N : M;
+
+	tensor *out = tensor2d(axis == 0 ? 1 : N, axis == 1 ? 1 : M, TEMP);
+	out->op = MAX; out->parent_l = x; 
+
+	#pragma omp parallel for
+	for (i32 i=0; i<outer; ++i)  {
+		out->data[i]=-FLT_MAX;
+		for (i32 j=0; j<inner; ++j) {
+			i32 offs = axis==0 ? j*M + i : i*M + j;
+			if (x->data[offs] > out->data[i])
+				out->data[i]=x->data[offs];
+		}
+	}
+	return out;
+}
 /*
  * Max pooling layer on 4d image tensor (NHWC)
  */
@@ -343,15 +384,15 @@ tensor *maxpool4d(tensor *x, i32 psize, i32 stride) {
 	i32 N=x->shape[0], H=x->shape[1], W=x->shape[2], C=x->shape[3];
 	i32 oh = calculate_kernel_dim(H, psize, stride), ow = calculate_kernel_dim(W, psize, stride);
 	tensor *cols = im2col(x, psize, stride);
-	SHAPE_2D(out, N*oh*ow, C)
-	tensor *out = new_tensor(2, out_shape, TEMP);
+	tensor *out = tensor2d(N*ow*ow, C, TEMP);
+	#pragma omp parallel for
 	for (i32 i=0; i<cols->shape[0]; ++i) {
 		for (i32 c=0; c<C; ++c) {
 			f32 max = -FLT_MAX;
 			for (i32 j=0; j<psize; ++j)
 				for (i32 k=0; k<psize; ++k)
 						if (cols->data[i*psize*psize*C + j*psize*C + k*C + c] > max)
-								max = cols->data[i*N*oh*ow + j*psize*C + k*C + c];
+								max = cols->data[i*psize*psize*C + j*psize*C + k*C + c];
 			out->data[i*N*oh*ow + c]=max;
 		}
 	}
@@ -373,6 +414,11 @@ void topodfs(tensor *t, i32 *n, tensor *topo[]) {
 	if (t->parent_r != NULL) topodfs((tensor*)t->parent_r, n, topo);
 	topo[(*n)++]=t;
 	return;
+}
+
+void accum_grad(tensor *target, tensor *delta) {
+	#pragma omp parallel for
+	for (i32 i=0; i<get_size(target); ++i) target->data[i]+=delta->data[i];
 }
 
 /*
@@ -404,8 +450,7 @@ tensor *backward(tensor *t) {
 		switch (node->op) {
 			case CREATE: break;
 			case RELU: dl = tensor_mul(grad, relu(lp, true)); break;
-			case IM2COL:
-				break;
+			case IM2COL: dl = col2im(node, lp); break;
 			case GEMM: 
 				dl = gemm2d(grad, transpose2d(rp));
 				dr = gemm2d(transpose2d(lp), grad);
@@ -421,12 +466,8 @@ tensor *backward(tensor *t) {
 			case RESHAPE: dl = reshape(grad, lp->ndims, lp->shape); break;
 			case CROSS_ENTROPY: sparse_ce_backwards(node, dl, grad); break;
 		}
-		if(lp != NULL) {
-			#pragma omp parallel for for (i32 i=0; i<get_size(lg); ++i) lg->data[i]+=dl->data[i];
-		}
-		if(rp != NULL) {
-			#pragma omp parallel for for (i32 i=0; i<get_size(rg); ++i) rg->data[i]+=dr->data[i];
-		}
+		if(lp != NULL) accum_grad(lg, dl);
+		if(rp != NULL) accum_grad(rg, dr);
 	}
 }
 
@@ -446,10 +487,8 @@ fc_layer *fc_init(i32 inputs, i32 outputs) {
 	fc_layer *layer = (fc_layer*)malloc(sizeof(fc_layer));
 	layer->inputs = inputs;
 	layer->outputs = outputs;
-	SHAPE_2D(w, outputs, inputs);
-	SHAPE_2D(b, outputs, 1)
-	layer->weights=new_tensor(2, w_shape, PARAM);
-	layer->bias=new_tensor(2, b_shape, PARAM);
+	layer->weights=tensor2d(outputs, inputs, PARAM);
+	layer->bias=tensor2d(outputs, 1, PARAM);
 
 	he_init(layer->weights->data, inputs, outputs);
 	return layer;
@@ -463,14 +502,52 @@ conv2d_layer *conv2d_init(i32 in_channels, i32 out_channels, i32 ksize, i32 stri
 	conv2d_layer *layer = (conv2d_layer*)malloc(sizeof(conv2d_layer));
 	layer->ksize = ksize; layer->stride = stride;
 	layer->in_channels = in_channels; layer->out_channels = out_channels;
-	SHAPE_2D(k, ksize*ksize*in_channels, out_channels)
-	SHAPE_2D(b, out_channels, 1)
-	layer->kernel = new_tensor(2, k_shape, PARAM);
-	layer->bias = new_tensor(2, b_shape, PARAM);
+	layer->kernel = tensor2d(ksize*ksize*in_channels, out_channels, PARAM);
+	layer->bias = tensor2d(out_channels, 1, PARAM);
 	return layer;
 }
 
 tensor *conv2d_forward(conv2d_layer *layer, tensor *__restrict__ x) {
 	tensor *cols = im2col(x, layer->ksize, layer->stride);
 	return  tensor_add(gemm2d(cols, layer->kernel), layer->bias);
+}
+
+batchnorm_layer *batchnorm_init(i32 size) {
+	batchnorm_layer *layer = (batchnorm_layer*)malloc(sizeof(batchnorm_layer));
+	layer->size = size;
+}
+
+tensor *batchnorm_forward(batchnorm_layer *layer, tensor *__restrict__ x) {
+}
+
+ADAM *adam_init(i32 nparams, tensor **params, f32 b1, f32 b2, f32 step_size) {
+	ADAM *adam = (ADAM*)malloc(sizeof(ADAM));
+	adam->b1 = b1; adam->b2 = b2; adam->step_size = step_size;
+	adam->nparams = nparams;
+	adam->step = 0;
+	for (i32 i=0; i<nparams; ++i) {
+		adam->m[i] = new_tensor(params[i]->ndims, params[i]->shape, PARAM);
+		adam->v[i] = new_tensor(params[i]->ndims, params[i]->shape, PARAM);
+		adam->params[i]=params[i];
+	}
+	return adam;
+}
+
+void adam_optimize(ADAM *adam) {
+	adam->step++;
+	f32 mn = 1.0f - powf(adam->b1, adam->step), vn = 1.0f - powf(adam->b2, adam->step);
+	#pragma omp parallel for
+	for (i32 i=0; i<adam->nparams; ++i) {
+		tensor *p = adam->params[i];
+		f32 *gd = ((tensor*)p->grad)->data;
+		i32 N = get_size(p);
+		f32 *md = adam->m[i]->data, *vd = adam->v[i]->data;
+		#pragma omp simd
+		for (i32 j=0; j<N; ++j) {
+			md[j]=adam->b1 * md[j] + (1 - adam->b1) * gd[j];
+			vd[j]=adam->b2 * vd[j] + (1 - adam->b2) * gd[j] * gd[j];
+			f32 mt = md[j] / mn, vt = vd[j] / vn;
+			p->data[j] -= adam->step_size * mt / (sqrtf(vt) + 1e-8);
+		}
+	}
 }
