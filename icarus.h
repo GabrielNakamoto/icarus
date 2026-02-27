@@ -1,6 +1,6 @@
 #pragma once
 
-#include <cfloat>
+#include <float.h>
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -54,19 +54,24 @@ typedef enum {
 #define MAX_DIMS 4
 #define SHAPE_2D(prefix, a, b) i32 prefix ## _shape[MAX_DIMS]; prefix ## _shape[0]=a; prefix ## _shape[1]=b;
 #define SHAPE_4D(prefix, a, b, c, d) i32 prefix ## _shape[MAX_DIMS]; prefix ## _shape[0]=a; prefix ## _shape[1]=b; prefix ## _shape[2]=c; prefix ## _shape[3]=d;
+
+typedef struct tensor tensor;
 typedef struct {
-	bool visited; void *grad;
-	void *parent_l, *parent_r;
-	Op op;
+	tensor *dl, *dr;
+} grads;
+typedef grads (*backward_fn)(tensor *node, tensor *grad);
+struct tensor {
+	bool visited;
+	tensor *grad;
+	tensor *parent_l, *parent_r;
+	backward_fn backward;
 	i32 col2im_stride;
 
 	alloc_type type;
 
 	i32 ndims, shape[MAX_DIMS], strides[MAX_DIMS];
 	f32 *data;
-} tensor;
-
-typedef void (*backward_fn)(tensor *node, tensor *grad);
+};
 
 typedef struct {
 	i32 inputs, outputs;
@@ -101,11 +106,11 @@ tensor *new_tensor(i32 ndims, i32 *shape, alloc_type type) {
 	tensor *t = (tensor*)arena_alloc(sizeof(tensor));
 	t->ndims = ndims;
 	t->visited = false;
-	t->op = CREATE;
 	t->parent_l = NULL; t->parent_r = NULL;
 	t->grad = NULL;
 	t->type = type;
 	t->col2im_stride = 0;
+	t->backward = NULL;
 	memcpy(t->shape, shape, ndims * sizeof(i32));
 	i32 bytes = get_size(t) * sizeof(f32);
 	switch (type) {
@@ -137,7 +142,63 @@ tensor *tensor24(i32 n, i32 h, i32 w, i32 c, alloc_type t) {
 typedef f32 (*biop_fn)(f32, f32);
 static inline f32 op_add(f32 a, f32 b) { return a + b; }
 static inline f32 op_mul(f32 a, f32 b) { return a * b; }
-tensor *apply_biop2d(tensor *__restrict__ a, tensor *__restrict__ b, biop_fn fn, Op op) {
+
+typedef enum { REDUCE_SUM, REDUCE_MAX } reduce_op;
+grads backward_sum(tensor *node, tensor *grad) {
+	tensor *x = node->parent_l, *dx = tensor2d(x->shape[0], x->shape[1], TEMP);
+	i32 N=x->shape[0], M=x->shape[1];
+	i32 axis = x->shape[0] == 1 ? 0 : 1;
+	#pragma omp parallel for
+	for (i32 i=0; i<N; ++i)
+		for (i32 j=0; j<M; ++j)
+			dx->data[i*M+j] = grad->data[axis == 0 ? j : i];
+	return (grads){ .dl=dx, .dr=NULL };
+}
+grads backward_max(tensor *node, tensor *grad) {
+	tensor *x = node->parent_l, *dx = tensor2d(x->shape[0], x->shape[1], TEMP);
+	i32 N=x->shape[0], M=x->shape[1];
+	i32 axis = x->shape[0] == 1 ? 0 : 1;
+	i32 outer = axis == 0 ? M : N, inner = axis == 0 ? N : M;
+
+	#pragma omp parallel for
+	for (i32 i=0; i<outer; ++i) {
+		i32 max_j = 0, max_v = -FLT_MAX;
+		for (i32 j=0; j<inner; ++j) {
+			f32 v = x->data[axis == 0 ? j*M+i : i*M+j];
+			if (v > max_v) { max_v=v; max_j=j; }
+		}
+		dx->data[axis == 0 ? max_j*M+i : i*M+max_j]=grad->data[i];
+	}
+	return (grads){ .dl=dx, .dr=NULL };
+}
+tensor *reduce2d(tensor *x, i32 axis, reduce_op op) {
+	i32 N=x->shape[0], M=x->shape[1];
+	tensor *out = tensor2d(axis == 0 ? 1 : N, axis == 1 ? 1 : M, TEMP);
+	i32 outer=axis == 0 ? M : N, inner = axis == 0 ? N : M;
+	#pragma omp parallel for
+	for (i32 i=0; i<outer; ++i) {
+		out->data[i]=op==REDUCE_SUM ? 0 : -FLT_MAX;
+		for (i32 j=0; j<inner; ++j) {
+			f32 v = x->data[axis==0?j*M+i:i*M+j];
+			if (op==REDUCE_SUM) out->data[i] += v;
+			else if (v > out->data[i]) out->data[i]=v;
+		}
+	}
+	out->parent_l = x;
+	out->backward = op == REDUCE_SUM ? &backward_sum : &backward_max;
+	return out;
+}
+#define sum_reduce2d(x, axis) reduce2d(x, axis, REDUCE_SUM)
+#define max_reduce2d(x, axis) reduce2d(x, axis, REDUCE_MAX)
+
+tensor *unbroadcast_grad2d(tensor *grad, tensor *target) {
+	if (get_size(target) == 1) return sum_reduce2d(sum_reduce2d(grad, 0), 1);
+	else if (target->shape[0] == 1) return sum_reduce2d(grad, 0);
+	else if (target->shape[1] == 1) return sum_reduce2d(grad, 1);
+	else return grad;
+}
+
+tensor *apply_biop2d(tensor *__restrict__ a, tensor *__restrict__ b, biop_fn fn, backward_fn backward) {
 	if (a->ndims != b->ndims) return NULL;
 	i32 a_size = get_size(a), b_size = get_size(b);
 	bool a_scalar = a_size == 1, b_scalar = b_size == 1;
@@ -149,7 +210,7 @@ tensor *apply_biop2d(tensor *__restrict__ a, tensor *__restrict__ b, biop_fn fn,
 	i32 cshape[MAX_DIMS];
 	for (i32 i=0; i<a->ndims; ++i) cshape[i] = a->shape[i] > b->shape[i] ? a->shape[i] : b->shape[i];
 	tensor *c = new_tensor(a->ndims, cshape, TEMP);
-	c->parent_l = a; c->parent_r = b; c->op = op;
+	c->parent_l = a; c->parent_r = b; c->backward = backward;
 
 	if (a_scalar || b_scalar) {
 		f32 s = a_scalar ? a->data[0] : b->data[0];
@@ -179,9 +240,41 @@ tensor *apply_biop2d(tensor *__restrict__ a, tensor *__restrict__ b, biop_fn fn,
 	}
 	return c;
 }
-tensor *tensor_add(tensor *a, tensor *b) { return apply_biop2d(a, b, &op_add, ADD); }
-tensor *tensor_mul(tensor *a, tensor *b) { return apply_biop2d(a, b, &op_mul, MUL); }
 
+
+tensor *tensor_mul(tensor *a, tensor *b);
+grads backward_mul(tensor *node, tensor *grad) {
+	tensor *lp = node->parent_l, *rp = node->parent_r;
+	return (grads) {
+		.dl = tensor_mul(unbroadcast_grad2d(grad, lp), lp),
+		.dr = tensor_mul(unbroadcast_grad2d(grad, lp), rp)
+	};
+}
+grads backward_add(tensor *node, tensor *grad) {
+	return (grads) {
+		.dl = unbroadcast_grad2d(grad, node->parent_l),
+		.dr = unbroadcast_grad2d(grad, node->parent_r)
+	};
+}
+tensor *tensor_add(tensor *a, tensor *b) { return apply_biop2d(a, b, &op_add, &backward_mul); }
+tensor *tensor_mul(tensor *a, tensor *b) { return apply_biop2d(a, b, &op_mul, &backward_add); }
+
+tensor *transpose2d(tensor *__restrict__ t) {
+	tensor *__restrict__ T = tensor2d(t->shape[1], t->shape[0], TEMP);
+	#pragma omp parallel for collapse(2)
+	for (i32 i=0; i<t->shape[0]; ++i) 
+			for (i32 j=0; j<t->shape[1]; ++j)
+				T->data[j*t->shape[0] + i]=t->data[i*t->shape[1] + j];
+	return T;
+}
+
+tensor *gemm2d(tensor *__restrict__ a, tensor *__restrict__ b);
+grads backward_gemm(tensor *node, tensor *grad) {
+	return (grads) {
+		.dl = gemm2d(grad, transpose2d(node->parent_r)),
+		.dr = gemm2d(transpose2d(node->parent_l), grad)
+	};
+}
 /*
 * Cache friendly 2d general matrix multiply
 */
@@ -190,7 +283,7 @@ tensor *gemm2d(tensor *__restrict__ a, tensor *__restrict__ b) {
 
 	i32 M=a->shape[0], N=a->shape[1], P=b->shape[1];
 	tensor *c = tensor2d(M, P, TEMP);
-	c->op = GEMM; c->parent_l = a; c->parent_r = b;
+	c->parent_l = a; c->parent_r = b; c->backward = &backward_gemm;
 	memset(c->data, 0, M * P * sizeof(f32));
 
 	#pragma omp parallel for
@@ -207,23 +300,59 @@ tensor *gemm2d(tensor *__restrict__ a, tensor *__restrict__ b) {
 /*
 * Forward and backward rectified linear unit activation function
 */
-tensor *relu(tensor *x, bool back) {
+tensor *_relu(tensor *x, bool back) {
 	i32 n = get_size(x);
 	tensor *y = new_tensor(x->ndims, x->shape, TEMP);
-	y->op = RELU; y->parent_l = x;
+	y->parent_l = x;
 
 	#pragma omp parallel for
 	for (i32 i=0; i<n; ++i) y->data[i] = x->data[i] > 0 ? (back ? 1 : x->data[i]) : 0;
+	return y;
+}
+grads backward_relu(tensor *node, tensor *grad) {
+	return (grads) {
+		.dl = tensor_mul(grad, _relu(node, true)),
+		.dr = NULL
+	};
+}
+tensor *relu(tensor *x) {
+	tensor *y =  _relu(x, false);
+	y->backward = &backward_relu;
 	return y;
 }
 
 /*
 * Fused log_softmax and crossentropy loss forwards
 */
+grads backward_sparsece(tensor *node, tensor *grad) {
+	tensor *y_hat = (tensor*)node->parent_l, *y = (tensor*)node->parent_r;
+	i32 N=y_hat->shape[0], C=y_hat->shape[1];
+	tensor *out = new_tensor(node->parent_l->ndims, node->parent_l->shape, TEMP);
+
+	#pragma omp parallel for
+	for (i32 i=0; i<N; ++i) {
+		f32 *xr = y_hat->data + i*C;
+		f32 *gr = out->data + i*C;
+		f32 up = grad->data[i];
+
+		f32 max = xr[0];
+		for (i32 j=0; j<C; ++j) if(xr[j] > max) max = xr[j];
+		f32 sum = 0.0f;
+		for (i32 j=0; j<C; ++j) sum += expf(xr[j] - max);
+
+		i32 label = (i32)y->data[i];
+		for (i32 j=0; j<C; ++j)
+			gr[j] = up * (expf(xr[j] - max) / sum - (j == label ? 1.0f : 0.0f));
+	}
+	return (grads) {
+		.dl = out,
+		.dr = NULL
+	};
+}
 tensor *sparse_crossentropy(tensor *__restrict__ y, tensor *__restrict__ y_hat) {
 	i32 N = y_hat->shape[0], C = y_hat->shape[1];
 	tensor *l = tensor2d(N, 1, TEMP);
-	l->op = CROSS_ENTROPY; l->parent_l = y_hat; l->parent_r = y;
+	l->parent_l = y_hat; l->parent_r = y; l->backward = &backward_sparsece;
 
 	#pragma omp parallel for
 	for (i32 i=0; i<N; ++i) {
@@ -242,50 +371,65 @@ tensor *sparse_crossentropy(tensor *__restrict__ y, tensor *__restrict__ y_hat) 
 	return l;
 }
 
-/*
- * Sparse cross entropy gradient computation
- */
-void sparse_ce_backwards(tensor *__restrict__ node, tensor *__restrict__ grad, tensor *__restrict__ upstream) {
-	tensor *y_hat = (tensor*)node->parent_l, *y = (tensor*)node->parent_r;
-	i32 N=y_hat->shape[0], C=y_hat->shape[1];
-
-	#pragma omp parallel for
-	for (i32 i=0; i<N; ++i) {
-		f32 *xr = y_hat->data + i*C;
-		f32 *gr = grad->data + i*C;
-		f32 up = upstream->data[i];
-
-		f32 max = xr[0];
-		for (i32 j=0; j<C; ++j) if(xr[j] > max) max = xr[j];
-		f32 sum = 0.0f;
-		for (i32 j=0; j<C; ++j) sum += expf(xr[j] - max);
-
-		i32 label = (i32)y->data[i];
-		for (i32 j=0; j<C; ++j)
-			gr[j] = up * (expf(xr[j] - max) / sum - (j == label ? 1.0f : 0.0f));
-	}
-}
 
 /*
 * Shallow reshape, no data copy
 */
+tensor *reshape(tensor *t, i32 ndims, i32 *shape);
+grads backward_reshape(tensor *node, tensor *grad) {
+	return (grads) {
+		.dl = reshape(grad, node->parent_l->ndims, node->parent_l->shape),
+		.dr = NULL
+	};
+}
 tensor *reshape(tensor *t, i32 ndims, i32 *shape) {
 	tensor *r = new_tensor(ndims, shape, SHALLOW);
-	r->op = RESHAPE; r->parent_l = t; r->data = t->data;
+	r->parent_l = t; r->data = t->data; r->backward = &backward_reshape;
 	return r;
 }
 
-tensor *transpose2d(tensor *__restrict__ t) {
-	tensor *__restrict__ T = tensor2d(t->shape[1], t->shape[0], TEMP);
-	#pragma omp parallel for collapse(2)
-	for (i32 i=0; i<t->shape[0]; ++i) 
-			for (i32 j=0; j<t->shape[1]; ++j)
-				T->data[j*t->shape[0] + i]=t->data[i*t->shape[1] + j];
-	return T;
+static inline i32 calculate_kernel_dim(i32 dimshape, i32 ksize, i32 kstride) {
+	return floor((dimshape - ksize) / kstride)+1;
 }
 
-static inline i32 calculate_kernel_dim(i32 dimshape, i32 ksize, i32 kstride) { return floor((dimshape - ksize) / kstride)+1; }
+/*
+ * Backwards for col2im transform
+ * Expands flattened windows into 4d window
+ */
+grads col2im(tensor *__restrict__ node, tensor *__restrict__ grad) {
+	tensor *im = node->parent_l;
+	i32 N=im->shape[0], H=im->shape[1], W=im->shape[2], C=im->shape[3];
+	i32 os = sqrt(grad->shape[0]/N), ksize=sqrt(grad->shape[1]/C), stride=grad->col2im_stride;
+	tensor *out = new_tensor(im->ndims, im->shape, TEMP);
+	memset(out->data, 0, get_size(out) * sizeof(f32));
 
+	// Iterate over output pos (n, h, w)
+	#pragma omp parallel for
+	for (i32 n=0; n<N; ++n) {
+		i32 window_offset = n*os*os;
+		for (i32 h=0; h<os; ++h) {
+			for (i32 w=0; w<os; ++w) {
+				i32 col_row_offset = h*os + w;
+				i32 image_offset = n*H*W*C;
+				// Iterate over kerenel position
+				for (i32 i=0; i<ksize; ++i) {
+					i32 row_offset = (h*stride + i)*W*C;
+					for (i32 j=0; j<ksize; ++j) {
+						i32 col_col_offset = (i*ksize+j)*C;
+						i32 col_offset = (w*stride + j)*C;
+						for (i32 c=0; c<C; ++c)
+							out->data[image_offset + row_offset + col_offset + c] +=
+								grad->data[(window_offset + col_row_offset)*grad->strides[0]  + col_col_offset + c];
+					}
+				}
+			}
+		}
+	}
+	return (grads) {
+		.dl = out,
+		.dr = NULL
+	};
+}
 /*
 * Transforms 4d image tensor with form NHWC
 * into 2d window collumns respecting kernel dimensions and stride
@@ -294,7 +438,7 @@ tensor *im2col(tensor *__restrict__ im, i32 size, i32 strides) {
 	i32 N=im->shape[0], H=im->shape[1], W=im->shape[2], C=im->shape[3];
 	i32 os = calculate_kernel_dim(H, size, strides);
 	tensor *cols = tensor2d(N*os*os, size*size*C, TEMP); 
-	cols->op = IM2COL; cols->parent_l = im; cols->col2im_stride = strides;
+	cols->parent_l = im; cols->col2im_stride = strides; cols->backward = &col2im;
 
 	#pragma omp parallel for collapse(3)
 	for (i32 n=0; n<N; ++n) {
@@ -318,73 +462,45 @@ tensor *im2col(tensor *__restrict__ im, i32 size, i32 strides) {
 	return cols;
 }
 
-/*
- * Backwards for col2im transform
- * Expands flattened windows into 4d window
- */
-tensor *col2im(tensor *__restrict__ cols, tensor *__restrict__ im) {
-	i32 N=im->shape[0], H=im->shape[1], W=im->shape[2], C=im->shape[3];
-	i32 os = sqrt(cols->shape[0]/N), ksize=sqrt(cols->shape[1]/C), stride=cols->col2im_stride;
-	tensor *out = new_tensor(im->ndims, im->shape, TEMP);
-	memset(out->data, 0, get_size(out) * sizeof(f32));
 
-	// Iterate over output pos (n, h, w)
-	#pragma omp parallel for
-	for (i32 n=0; n<N; ++n) {
-		i32 window_offset = n*os*os;
-		for (i32 h=0; h<os; ++h) {
-			for (i32 w=0; w<os; ++w) {
-				i32 col_row_offset = h*os + w;
-				i32 image_offset = n*H*W*C;
-				// Iterate over kerenel position
-				for (i32 i=0; i<ksize; ++i) {
-					i32 row_offset = (h*stride + i)*W*C;
-					for (i32 j=0; j<ksize; ++j) {
-						i32 col_col_offset = (i*ksize+j)*C;
-						i32 col_offset = (w*stride + j)*C;
-						for (i32 c=0; c<C; ++c)
-							out->data[image_offset + row_offset + col_offset + c] +=
-								cols->data[(window_offset + col_row_offset)*cols->strides[0]  + col_col_offset + c];
-					}
-				}
-			}
-		}
-	}
-	return out;
-}
-
-
-/*
- * Reduces a 2d tensor with a max operation across
- * the specified axis
- * - keeps dims
- */
-tensor *max_reduce2d(tensor *x, i32 axis) {
-	i32 N=x->shape[0], M=x->shape[1];
-	i32 outer = axis == 0 ? M : N, inner = axis == 0 ? N : M;
-
-	tensor *out = tensor2d(axis == 0 ? 1 : N, axis == 1 ? 1 : M, TEMP);
-	out->op = MAX; out->parent_l = x; 
-
-	#pragma omp parallel for
-	for (i32 i=0; i<outer; ++i)  {
-		out->data[i]=-FLT_MAX;
-		for (i32 j=0; j<inner; ++j) {
-			i32 offs = axis==0 ? j*M + i : i*M + j;
-			if (x->data[offs] > out->data[i])
-				out->data[i]=x->data[offs];
-		}
-	}
-	return out;
-}
 /*
  * Max pooling layer on 4d image tensor (NHWC)
  */
+grads backward_maxpool(tensor *node, tensor *grad) {
+	tensor *cols = node->parent_l;
+	tensor *im = cols->parent_l;
+	i32 C = im->shape[3];
+	i32 psize = sqrt(cols->shape[1] / C);
+
+	tensor *dcols = tensor2d(cols->shape[0], cols->shape[1], TEMP);
+	memset(dcols->data, 0, get_size(dcols) * sizeof(f32));
+
+	#pragma omp parallel for
+	for (i32 i=0; i<cols->shape[0]; ++i) {
+		for (i32 c=0; c<C; ++c) {
+			f32 max = -FLT_MAX;
+			i32 max_j=0, max_k=0;
+			for (i32 j=0; j<psize; ++j) {
+				for (i32 k=0; k<psize; ++k) {
+					f32 v = cols->data[i*psize*psize*C + j*psize*C + k*C + c];
+					if (v > max) { max=v; max_j=j; max_k=k; }
+				}
+			}
+			dcols->data[i*psize*psize*C + max_j*psize*C + max_k*C + c] = grad->data[i*C + c];
+		}
+	}
+
+	dcols->parent_l = im;
+	dcols->col2im_stride = node->col2im_stride;
+	return col2im(dcols, dcols);
+}
 tensor *maxpool4d(tensor *x, i32 psize, i32 stride) {
 	i32 N=x->shape[0], H=x->shape[1], W=x->shape[2], C=x->shape[3];
 	i32 oh = calculate_kernel_dim(H, psize, stride), ow = calculate_kernel_dim(W, psize, stride);
 	tensor *cols = im2col(x, psize, stride);
-	tensor *out = tensor2d(N*ow*ow, C, TEMP);
+	tensor *out = tensor2d(N*oh*ow, C, TEMP);
+	out->parent_l = cols; out->col2im_stride = stride; out->backward = &backward_maxpool;
+
 	#pragma omp parallel for
 	for (i32 i=0; i<cols->shape[0]; ++i) {
 		for (i32 c=0; c<C; ++c) {
@@ -393,14 +509,11 @@ tensor *maxpool4d(tensor *x, i32 psize, i32 stride) {
 				for (i32 k=0; k<psize; ++k)
 						if (cols->data[i*psize*psize*C + j*psize*C + k*C + c] > max)
 								max = cols->data[i*psize*psize*C + j*psize*C + k*C + c];
-			out->data[i*N*oh*ow + c]=max;
+			out->data[i*C + c]=max;
 		}
 	}
 	SHAPE_4D(final, N, oh, ow, C)
 	return reshape(out, 4, final_shape);
-}
-
-void unbroadcast_grad2d(tensor *grad, tensor *target) {
 }
 
 /*
@@ -429,7 +542,6 @@ tensor *backward(tensor *t) {
 	i32 n = 0;
 	topodfs(t, &n, topo);
 
-	// Zero + init grads
 	for (i32 i=0; i<n-1; ++i) {
 		if (topo[i]->grad == NULL) topo[i]->grad = new_tensor(topo[i]->ndims, topo[i]->shape, topo[i]->type);
 		memset(((tensor*)topo[i]->grad)->data, 0.0f, get_size(topo[i]) * sizeof(f32));
@@ -437,37 +549,10 @@ tensor *backward(tensor *t) {
 	for (i32 i=0; i<get_size(topo[n-1]); ++i) ((tensor*)topo[n-1]->grad)->data[i]=1.0f;
 	for (i32 i=n-1; i>=0; i--) {
 		tensor *node = topo[i];
-		tensor *grad = (tensor*)node->grad;
-		tensor *lp, *rp, *lg, *rg, *dl, *dr;
-		if (node->parent_l != NULL) {
-			lp = (tensor*)node->parent_l;
-			lg = (tensor*)lp->grad;
-		}
-		if (node->parent_r != NULL) {
-			rp = (tensor*)node->parent_r;
-			rg = (tensor*)rp->grad;
-		}
-		switch (node->op) {
-			case CREATE: break;
-			case RELU: dl = tensor_mul(grad, relu(lp, true)); break;
-			case IM2COL: dl = col2im(node, lp); break;
-			case GEMM: 
-				dl = gemm2d(grad, transpose2d(rp));
-				dr = gemm2d(transpose2d(lp), grad);
-				break;
-			case ADD:
-				dl = grad;
-				dr = grad;
-				break;
-			case MUL:
-				dl = tensor_mul(grad, rp);
-				dr = tensor_mul(grad, lp);
-				break;
-			case RESHAPE: dl = reshape(grad, lp->ndims, lp->shape); break;
-			case CROSS_ENTROPY: sparse_ce_backwards(node, dl, grad); break;
-		}
-		if(lp != NULL) accum_grad(lg, dl);
-		if(rp != NULL) accum_grad(rg, dr);
+		if (!node->backward) continue;
+		grads g = node->backward(node, node->grad);
+		if (node->parent_l && g.dl) accum_grad(node->parent_l->grad, g.dl);
+		if (node->parent_r && g.dr) accum_grad(node->parent_r->grad, g.dr);
 	}
 }
 
